@@ -3,8 +3,6 @@ btparse
 
 A minimal deserializer for inspecting `std::backtrace::Backtrace`'s Debug format.
 
-<br>
-
 ## Overview
 
 For the time being, the rust standard library is exporting the smallest API
