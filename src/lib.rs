@@ -1,7 +1,5 @@
 #![feature(backtrace)]
-#![feature(track_caller)]
 use std::fmt;
-use std::panic::Location;
 
 mod deser;
 
@@ -18,8 +16,6 @@ pub struct Frame {
 #[derive(Debug)]
 pub struct Error {
     kind: Kind,
-    location: &'static Location<'static>,
-    bt: std::backtrace::Backtrace,
 }
 
 #[derive(Debug)]
@@ -34,8 +30,7 @@ enum Kind {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{} @ {}", self.kind, self.location)?;
-        writeln!(f, "{}", self.bt)
+        writeln!(f, "{}", self.kind)
     }
 }
 
@@ -61,13 +56,8 @@ impl fmt::Display for Kind {
 impl std::error::Error for Error {}
 
 impl From<Kind> for Error {
-    #[track_caller]
     fn from(kind: Kind) -> Self {
-        Self {
-            kind,
-            location: Location::caller(),
-            bt: std::backtrace::Backtrace::capture(),
-        }
+        Self { kind }
     }
 }
 
