@@ -1,0 +1,21 @@
+[package]
+name = "btparse"
+version = "0.1.0"
+authors = ["Jane Lusby <jlusby@yaah.dev>"]
+edition = "2018"
+repository = "https://github.com/yaahc/btparse"
+homepage = "https://github.com/yaahc/btparse"
+documentation = "https://docs.rs/btparse"
+description = """
+A minimal deserializer for inspecting `std::backtrace::Backtrace`'s Debug format.
+"""
+keywords = ["backtrace", "std", "parse"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[dev-dependencies]
+eyre = "0.3.8"
