@@ -7,13 +7,8 @@ use std::fmt;
 mod deser;
 
 #[derive(Debug)]
-pub struct Backtrace(Vec<Frame>);
-
-impl Backtrace {
-    pub fn frames(&self) -> &[Frame] {
-        &*self.0
-    }
-}
+#[non_exhaustive]
+pub struct Backtrace(pub Vec<Frame>);
 
 #[derive(Debug, PartialEq)]
 pub struct Frame {
