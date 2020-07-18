@@ -5,7 +5,7 @@ use std::process::{Command, ExitStatus, Stdio};
 
 // This code exercises the surface area that we expect of the std Backtrace
 // type. If the current toolchain is able to compile it, we go ahead and use
-// backtrace in anyhow.
+// backtrace in btparse.
 const PROBE: &str = r#"
     #![feature(backtrace)]
     #![allow(dead_code)]
@@ -49,7 +49,7 @@ fn compile_probe() -> Option<ExitStatus> {
     Command::new(rustc)
         .stderr(Stdio::null())
         .arg("--edition=2018")
-        .arg("--crate-name=color_anyhow_build")
+        .arg("--crate-name=btparse_build")
         .arg("--crate-type=lib")
         .arg("--emit=metadata")
         .arg("--out-dir")
