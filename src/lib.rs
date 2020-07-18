@@ -1,10 +1,19 @@
-#![feature(backtrace)]
+#![allow(clippy::try_err)]
+#![cfg_attr(backtrace, feature(backtrace))]
+#[cfg(backtrace)]
 use std::fmt;
 
+#[cfg(backtrace)]
 mod deser;
 
 #[derive(Debug)]
 pub struct Backtrace(Vec<Frame>);
+
+impl Backtrace {
+    pub fn frames(&self) -> &[Frame] {
+        &*self.0
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub struct Frame {
@@ -14,11 +23,13 @@ pub struct Frame {
 }
 
 #[derive(Debug)]
+#[cfg(backtrace)]
 pub struct Error {
     kind: Kind,
 }
 
 #[derive(Debug)]
+#[cfg(backtrace)]
 enum Kind {
     Disabled,
     Empty,
@@ -28,12 +39,14 @@ enum Kind {
     LineParse(String, std::num::ParseIntError),
 }
 
+#[cfg(backtrace)]
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{}", self.kind)
     }
 }
 
+#[cfg(backtrace)]
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -53,19 +66,23 @@ impl fmt::Display for Kind {
     }
 }
 
+#[cfg(backtrace)]
 impl std::error::Error for Error {}
 
+#[cfg(backtrace)]
 impl From<Kind> for Error {
     fn from(kind: Kind) -> Self {
         Self { kind }
     }
 }
 
+#[cfg(backtrace)]
 pub fn deserialize(bt: &std::backtrace::Backtrace) -> Result<Backtrace, Error> {
     let bt_str = format!("{:?}", bt);
     deserialize_str(&bt_str)
 }
 
+#[cfg(backtrace)]
 fn deserialize_str(bt: &str) -> Result<Backtrace, Error> {
     let mut frames = vec![];
     let mut bt = deser::header(bt)?;
@@ -92,7 +109,7 @@ fn deserialize_str(bt: &str) -> Result<Backtrace, Error> {
     Ok(Backtrace(frames))
 }
 
-#[cfg(test)]
+#[cfg(all(test, backtrace))]
 mod tests {
     use super::*;
 
