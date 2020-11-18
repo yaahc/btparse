@@ -1,10 +1,11 @@
 #![feature(backtrace)]
+#![allow(clippy::try_err)]
 use std::fmt;
 
 mod deser;
 
 #[derive(Debug)]
-pub struct Backtrace(Vec<Frame>);
+pub struct Backtrace(pub Vec<Frame>);
 
 #[derive(Debug, PartialEq)]
 pub struct Frame {
