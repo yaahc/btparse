@@ -1,11 +1,32 @@
+//! An error utility library for deserializing `std::backtrace::Backtrace`'s
+//! based on its `Debug` format.
+#![doc(html_root_url = "https://docs.rs/btparse/0.1.1")]
 #![feature(backtrace)]
+#![allow(clippy::try_err)]
 use std::fmt;
 
 mod deser;
 
+/// A deserialized Backtrace.
+///
+/// # Example
+///
+/// ```rust
+/// #![feature(backtrace)]
+///
+/// let backtrace = std::backtrace::Backtrace::force_capture();
+/// let backtrace = btparse::deserialize(&backtrace).unwrap();
+/// for frame in &backtrace.frames {
+///     println!("{:?}", frame);
+/// }
+/// ```
 #[derive(Debug)]
-pub struct Backtrace(Vec<Frame>);
+#[non_exhaustive]
+pub struct Backtrace {
+    pub frames: Vec<Frame>,
+}
 
+/// A backtrace frame.
 #[derive(Debug, PartialEq)]
 pub struct Frame {
     pub function: String,
@@ -13,6 +34,7 @@ pub struct Frame {
     pub line: Option<usize>,
 }
 
+/// An error that prevented a backtrace from being deserialized.
 #[derive(Debug)]
 pub struct Error {
     kind: Kind,
@@ -61,6 +83,8 @@ impl From<Kind> for Error {
     }
 }
 
+/// Deserialize a backtrace based on its debug format and return a parsed
+/// representation containing a vector of frames.
 pub fn deserialize(bt: &std::backtrace::Backtrace) -> Result<Backtrace, Error> {
     let bt_str = format!("{:?}", bt);
     deserialize_str(&bt_str)
@@ -89,7 +113,7 @@ fn deserialize_str(bt: &str) -> Result<Backtrace, Error> {
         Err(Kind::UnexpectedInput(bt.into()))?;
     }
 
-    Ok(Backtrace(frames))
+    Ok(Backtrace { frames })
 }
 
 #[cfg(test)]
@@ -124,32 +148,34 @@ mod tests {
     #[test]
     fn deserialize_simple() -> eyre::Result<()> {
         let backtrace = r#"Backtrace [{fn: "fn1", file: "fi"le1", line: 1}, {fn: "fn2", line: 2}, {fn: "fn3", file: "file3"}, {fn: "fn4"}]"#;
-        let expected = Backtrace(vec![
-            Frame {
-                function: "fn1".into(),
-                file: Some("fi\"le1".into()),
-                line: Some(1),
-            },
-            Frame {
-                function: "fn2".into(),
-                file: None,
-                line: Some(2),
-            },
-            Frame {
-                function: "fn3".into(),
-                file: Some("file3".into()),
-                line: None,
-            },
-            Frame {
-                function: "fn4".into(),
-                file: None,
-                line: None,
-            },
-        ]);
+        let expected = Backtrace {
+            frames: vec![
+                Frame {
+                    function: "fn1".into(),
+                    file: Some("fi\"le1".into()),
+                    line: Some(1),
+                },
+                Frame {
+                    function: "fn2".into(),
+                    file: None,
+                    line: Some(2),
+                },
+                Frame {
+                    function: "fn3".into(),
+                    file: Some("file3".into()),
+                    line: None,
+                },
+                Frame {
+                    function: "fn4".into(),
+                    file: None,
+                    line: None,
+                },
+            ],
+        };
         let bt_parsed = super::deserialize_str(backtrace)?;
         dbg!(&bt_parsed);
 
-        assert_eq!(expected.0, bt_parsed.0);
+        assert_eq!(expected.frames, bt_parsed.frames);
 
         Ok(())
     }
