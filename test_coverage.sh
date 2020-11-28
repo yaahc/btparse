@@ -7,7 +7,7 @@ mkdir -p ./target/debug/coverage
 DO_ET="fool" LLVM_PROFILE_FILE="${PWD}/target/debug/coverage/test.%p.profraw" RUSTFLAGS="-Zinstrument-coverage" cargo test
 git add .
 git commit -m "checkpoint"
-git push
+git push || true
 $(rustc --print target-libdir)/../bin/llvm-profdata merge --sparse ./target/debug/coverage/test.*.profraw -o ./target/test.profdata
 
 # This one works and shows all the details I want in the CLI
