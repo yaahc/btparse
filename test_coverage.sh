@@ -6,7 +6,7 @@ rm -rf ./target/
 mkdir -p ./target/debug/coverage
 DO_ET="fool" LLVM_PROFILE_FILE="${PWD}/target/debug/coverage/test.%p.profraw" RUSTFLAGS="-Zinstrument-coverage" cargo test
 git add .
-git commit -m "checkpoint2"
+git commit -m "checkpoint3"
 git push || true
 $(rustc --print target-libdir)/../bin/llvm-profdata merge --sparse ./target/debug/coverage/test.*.profraw -o ./target/test.profdata
 
