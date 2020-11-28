@@ -11,10 +11,11 @@ git push || true
 $(rustc --print target-libdir)/../bin/llvm-profdata merge --sparse ./target/debug/coverage/test.*.profraw -o ./target/test.profdata
 
 # This one works and shows all the details I want in the CLI
-$(rustc --print target-libdir)/../bin/llvm-cov show -format=html -Xdemangler=rustfilt -instr-profile=./target/test.profdata $(find target/debug/deps -type f -perm -u+x ! -name '*.so') -show-regions -show-instantiations > index.html
+$(rustc --print target-libdir)/../bin/llvm-cov show -format=html -instr-profile=./target/test.profdata $(find target/debug/deps -type f -perm -u+x ! -name '*.so') > coverage.html
+mv coverage.html ./target
 
 # This one gives an error indicating that there was an error parsing the report
-$(rustc --print target-libdir)/../bin/llvm-cov show -Xdemangler=rustfilt -instr-profile=./target/test.profdata $(find target/debug/deps -type f -perm -u+x ! -name '*.so') -show-regions -show-instantiations > coverage.txt
+$(rustc --print target-libdir)/../bin/llvm-cov show -instr-profile=./target/test.profdata $(find target/debug/deps -type f -perm -u+x ! -name '*.so') > coverage.txt
 mv coverage.txt ./target
 # bash <(curl -s https://codecov.io/bash) -f coverage.txt -t <token>
 
