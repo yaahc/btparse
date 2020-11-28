@@ -32,6 +32,10 @@ jobs:
       - name: Merge coverage data
         run: $(rustc --print target-libdir)/../bin/llvm-profdata merge --sparse test.*.profraw -o test.profdata
       - name: Generate coverage report
-        run: $(rustc --print target-libdir)/../bin/llvm-cov export -format=text -instr-profile=test.profdata $(find target/debug/deps -type f -perm -u+x ! -name '*.so') > "coverage.json"
+        run: $(rustc --print target-libdir)/../bin/llvm-cov show -format=html -Xdemangler=rustfilt -show-instantiations -output-dir=./coverage -instr-profile=./test.profdata $(find target/debug/deps -type f -perm -u+x ! -name '*.so')
+      - uses: actions/upload-artifact@v2
+        with:
+          name: coverage
+          path: ./coverage
       - name: Upload coverage report to Codecov
         uses: codecov/codecov-action@v1
