@@ -35,5 +35,3 @@ jobs:
         run: $(rustc --print target-libdir)/../bin/llvm-cov export -format=text -instr-profile=test.profdata $(find target/debug/deps -type f -perm -u+x ! -name '*.so') > "coverage.json"
       - name: Upload coverage report to Codecov
         uses: codecov/codecov-action@v1
-      - name: Coveralls GitHub Action
-        uses: coverallsapp/github-action@v1.1.2
