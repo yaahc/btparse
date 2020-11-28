@@ -1,5 +1,6 @@
 #! /bin/bash
 set -e
+set -o xtrace
 
 rm -rf ./target/
 mkdir -p ./target/debug/coverage
