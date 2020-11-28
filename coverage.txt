@@ -1,0 +1,2530 @@
+/home/jlusby/.cargo/registry/src/github.com-1ecc6299db9ec823/eyre-0.3.10/src/chain.rs:
+    1|       |use self::ChainState::*;
+    2|       |use crate::StdError;
+    3|       |
+    4|       |#[cfg(feature = "std")]
+    5|       |use std::vec;
+    6|       |
+    7|       |#[cfg(feature = "std")]
+    8|       |pub(crate) use crate::Chain;
+    9|       |
+   10|       |#[cfg(not(feature = "std"))]
+   11|       |pub(crate) struct Chain<'a> {
+   12|       |    state: ChainState<'a>,
+   13|       |}
+   14|       |
+   15|       |#[derive(Clone)]
+   16|       |pub(crate) enum ChainState<'a> {
+   17|       |    Linked {
+   18|       |        next: Option<&'a (dyn StdError + 'static)>,
+   19|       |    },
+   20|       |    #[cfg(feature = "std")]
+   21|       |    Buffered {
+   22|       |        rest: vec::IntoIter<&'a (dyn StdError + 'static)>,
+   23|       |    },
+   24|       |}
+   25|       |
+   26|       |impl<'a> Chain<'a> {
+   27|       |    pub fn new(head: &'a (dyn StdError + 'static)) -> Self {
+   28|       |        Chain {
+   29|       |            state: ChainState::Linked { next: Some(head) },
+   30|       |        }
+   31|       |    }
+   32|       |}
+   33|       |
+   34|       |impl<'a> Iterator for Chain<'a> {
+   35|       |    type Item = &'a (dyn StdError + 'static);
+   36|       |
+   37|       |    fn next(&mut self) -> Option<Self::Item> {
+   38|      0|        match &mut self.state {
+   39|      0|            Linked { next } => {
+   40|      0|                let error = (*next)?;
+   41|      0|                *next = error.source();
+   42|      0|                Some(error)
+   43|       |            }
+   44|       |            #[cfg(feature = "std")]
+   45|      0|            Buffered { rest } => rest.next(),
+   46|      0|        }
+   47|      0|    }
+   48|       |
+   49|       |    fn size_hint(&self) -> (usize, Option<usize>) {
+   50|       |        let len = self.len();
+   51|       |        (len, Some(len))
+   52|       |    }
+   53|       |}
+   54|       |
+   55|       |#[cfg(feature = "std")]
+   56|       |impl DoubleEndedIterator for Chain<'_> {
+   57|       |    fn next_back(&mut self) -> Option<Self::Item> {
+   58|      0|        match &mut self.state {
+   59|      0|            Linked { mut next } => {
+   60|      0|                let mut rest = Vec::new();
+   61|      0|                while let Some(cause) = next {
+   62|      0|                    next = cause.source();
+   63|      0|                    rest.push(cause);
+   64|      0|                }
+   65|      0|                let mut rest = rest.into_iter();
+   66|      0|                let last = rest.next_back();
+   67|      0|                self.state = Buffered { rest };
+   68|      0|                last
+   69|       |            }
+   70|      0|            Buffered { rest } => rest.next_back(),
+   71|      0|        }
+   72|      0|    }
+   73|       |}
+   74|       |
+   75|       |impl ExactSizeIterator for Chain<'_> {
+   76|       |    fn len(&self) -> usize {
+   77|      0|        match &self.state {
+   78|      0|            Linked { mut next } => {
+   79|      0|                let mut len = 0;
+   80|      0|                while let Some(cause) = next {
+   81|      0|                    next = cause.source();
+   82|      0|                    len += 1;
+   83|       |                }
+   84|      0|                len
+   85|       |            }
+   86|       |            #[cfg(feature = "std")]
+   87|      0|            Buffered { rest } => rest.len(),
+   88|      0|        }
+   89|      0|    }
+   90|       |}
+   91|       |
+   92|       |#[cfg(feature = "std")]
+   93|       |impl Default for Chain<'_> {
+   94|       |    fn default() -> Self {
+   95|       |        Chain {
+   96|       |            state: ChainState::Buffered {
+   97|       |                rest: Vec::new().into_iter(),
+   98|       |            },
+   99|       |        }
+  100|       |    }
+  101|       |}
+
+/home/jlusby/.cargo/registry/src/github.com-1ecc6299db9ec823/eyre-0.3.10/src/error.rs:
+    1|       |use crate::alloc::Box;
+    2|       |use crate::chain::Chain;
+    3|       |use crate::EyreContext;
+    4|       |use crate::{Report, StdError};
+    5|       |use core::any::Any;
+    6|       |use core::any::TypeId;
+    7|       |use core::fmt::{self, Debug, Display};
+    8|       |use core::mem::{self, ManuallyDrop};
+    9|       |use core::ptr::{self, NonNull};
+   10|       |
+   11|       |#[cfg(backtrace)]
+   12|       |use crate::backtrace::Backtrace;
+   13|       |
+   14|       |#[cfg(feature = "std")]
+   15|       |use core::ops::{Deref, DerefMut};
+   16|       |
+   17|       |impl<C> Report<C>
+   18|       |where
+   19|       |    C: EyreContext,
+   20|       |{
+   21|       |    /// Create a new error object from any error type.
+   22|       |    ///
+   23|       |    /// The error type must be threadsafe and `'static`, so that the `Report`
+   24|       |    /// will be as well.
+   25|       |    ///
+   26|       |    /// If the error type does not provide a backtrace, a backtrace will be
+   27|       |    /// created here to ensure that a backtrace exists.
+   28|       |    #[cfg(feature = "std")]
+   29|       |    #[cfg_attr(doc_cfg, doc(cfg(feature = "std")))]
+   30|       |    pub fn new<E>(error: E) -> Self
+   31|       |    where
+   32|       |        E: StdError + Send + Sync + 'static,
+   33|       |    {
+   34|       |        Report::from_std(error)
+   35|       |    }
+   36|       |
+   37|       |    /// Create a new error object from a printable error message.
+   38|       |    ///
+   39|       |    /// If the argument implements std::error::Error, prefer `Report::new`
+   40|       |    /// instead which preserves the underlying error's cause chain and
+   41|       |    /// backtrace. If the argument may or may not implement std::error::Error
+   42|       |    /// now or in the future, use `eyre!(err)` which handles either way
+   43|       |    /// correctly.
+   44|       |    ///
+   45|       |    /// `Report::msg("...")` is equivalent to `eyre!("...")` but occasionally
+   46|       |    /// convenient in places where a function is preferable over a macro, such
+   47|       |    /// as iterator or stream combinators:
+   48|       |    ///
+   49|       |    /// ```
+   50|       |    /// # mod ffi {
+   51|       |    /// #     pub struct Input;
+   52|       |    /// #     pub struct Output;
+   53|       |    /// #     pub async fn do_some_work(_: Input) -> Result<Output, &'static str> {
+   54|       |    /// #         unimplemented!()
+   55|       |    /// #     }
+   56|       |    /// # }
+   57|       |    /// #
+   58|       |    /// # use ffi::{Input, Output};
+   59|       |    /// #
+   60|       |    /// use eyre::{Report, Result};
+   61|       |    /// use futures::stream::{Stream, StreamExt, TryStreamExt};
+   62|       |    ///
+   63|       |    /// async fn demo<S>(stream: S) -> Result<Vec<Output>>
+   64|       |    /// where
+   65|       |    ///     S: Stream<Item = Input>,
+   66|       |    /// {
+   67|       |    ///     stream
+   68|       |    ///         .then(ffi::do_some_work) // returns Result<Output, &str>
+   69|       |    ///         .map_err(Report::msg)
+   70|       |    ///         .try_collect()
+   71|       |    ///         .await
+   72|       |    /// }
+   73|       |    /// ```
+   74|       |    pub fn msg<M>(message: M) -> Self
+   75|       |    where
+   76|       |        M: Display + Debug + Send + Sync + 'static,
+   77|       |    {
+   78|       |        Report::from_adhoc(message)
+   79|       |    }
+   80|       |
+   81|       |    #[cfg(feature = "std")]
+   82|       |    pub(crate) fn from_std<E>(error: E) -> Self
+   83|       |    where
+   84|       |        E: StdError + Send + Sync + 'static,
+   85|       |    {
+   86|       |        let vtable = &ErrorVTable {
+   87|       |            object_drop: object_drop::<E, C>,
+   88|       |            object_ref: object_ref::<E, C>,
+   89|       |            #[cfg(feature = "std")]
+   90|       |            object_mut: object_mut::<E, C>,
+   91|       |            object_boxed: object_boxed::<E, C>,
+   92|       |            object_downcast: object_downcast::<E, C>,
+   93|       |            object_drop_rest: object_drop_front::<E, C>,
+   94|       |        };
+   95|       |
+   96|       |        // Safety: passing vtable that operates on the right type E.
+   97|       |        let context = Some(C::default(&error));
+   98|       |        unsafe { Report::construct(error, vtable, context) }
+   99|       |    }
+  100|       |
+  101|       |    pub(crate) fn from_adhoc<M>(message: M) -> Self
+  102|       |    where
+  103|       |        M: Display + Debug + Send + Sync + 'static,
+  104|       |    {
+  105|       |        use crate::wrapper::MessageError;
+  106|       |        let error: MessageError<M> = MessageError(message);
+  107|       |        let vtable = &ErrorVTable {
+  108|       |            object_drop: object_drop::<MessageError<M>, C>,
+  109|       |            object_ref: object_ref::<MessageError<M>, C>,
+  110|       |            #[cfg(feature = "std")]
+  111|       |            object_mut: object_mut::<MessageError<M>, C>,
+  112|       |            object_boxed: object_boxed::<MessageError<M>, C>,
+  113|       |            object_downcast: object_downcast::<M, C>,
+  114|       |            object_drop_rest: object_drop_front::<M, C>,
+  115|       |        };
+  116|       |
+  117|       |        // Safety: MessageError is repr(transparent) so it is okay for the
+  118|       |        // vtable to allow casting the MessageError<M> to M.
+  119|       |        let context = Some(C::default(&error));
+  120|       |        unsafe { Report::construct(error, vtable, context) }
+  121|       |    }
+  122|       |
+  123|       |    #[cfg(feature = "std")]
+  124|       |    pub(crate) fn from_msg<D, E>(msg: D, error: E) -> Self
+  125|       |    where
+  126|       |        D: Display + Send + Sync + 'static,
+  127|       |        E: StdError + Send + Sync + 'static,
+  128|       |    {
+  129|       |        let error: ContextError<D, E> = ContextError { msg, error };
+  130|       |
+  131|       |        let vtable = &ErrorVTable {
+  132|       |            object_drop: object_drop::<ContextError<D, E>, C>,
+  133|       |            object_ref: object_ref::<ContextError<D, E>, C>,
+  134|       |            #[cfg(feature = "std")]
+  135|       |            object_mut: object_mut::<ContextError<D, E>, C>,
+  136|       |            object_boxed: object_boxed::<ContextError<D, E>, C>,
+  137|       |            object_downcast: context_downcast::<D, E, C>,
+  138|       |            object_drop_rest: context_drop_rest::<D, E, C>,
+  139|       |        };
+  140|       |
+  141|       |        // Safety: passing vtable that operates on the right type.
+  142|       |        let context = Some(C::default(&error));
+  143|       |        unsafe { Report::construct(error, vtable, context) }
+  144|       |    }
+  145|       |
+  146|       |    #[cfg(feature = "std")]
+  147|       |    pub(crate) fn from_boxed(error: Box<dyn StdError + Send + Sync>) -> Self {
+  148|       |        use crate::wrapper::BoxedError;
+  149|       |        let error = BoxedError(error);
+  150|       |        let context = Some(C::default(&error));
+  151|       |        let vtable = &ErrorVTable {
+  152|       |            object_drop: object_drop::<BoxedError, C>,
+  153|       |            object_ref: object_ref::<BoxedError, C>,
+  154|       |            #[cfg(feature = "std")]
+  155|       |            object_mut: object_mut::<BoxedError, C>,
+  156|       |            object_boxed: object_boxed::<BoxedError, C>,
+  157|       |            object_downcast: object_downcast::<Box<dyn StdError + Send + Sync>, C>,
+  158|       |            object_drop_rest: object_drop_front::<Box<dyn StdError + Send + Sync>, C>,
+  159|       |        };
+  160|       |
+  161|       |        // Safety: BoxedError is repr(transparent) so it is okay for the vtable
+  162|       |        // to allow casting to Box<dyn StdError + Send + Sync>.
+  163|       |        unsafe { Report::construct(error, vtable, context) }
+  164|       |    }
+  165|       |
+  166|       |    // Takes backtrace as argument rather than capturing it here so that the
+  167|       |    // user sees one fewer layer of wrapping noise in the backtrace.
+  168|       |    //
+  169|       |    // Unsafe because the given vtable must have sensible behavior on the error
+  170|       |    // value of type E.
+  171|       |    unsafe fn construct<E>(error: E, vtable: &'static ErrorVTable<C>, context: Option<C>) -> Self
+  172|       |    where
+  173|       |        E: StdError + Send + Sync + 'static,
+  174|       |    {
+  175|       |        let inner = Box::new(ErrorImpl {
+  176|       |            vtable,
+  177|       |            context,
+  178|       |            _object: error,
+  179|       |        });
+  180|       |        // Erase the concrete type of E from the compile-time type system. This
+  181|       |        // is equivalent to the safe unsize coersion from Box<ErrorImpl<E>> to
+  182|       |        // Box<ErrorImpl<dyn StdError + Send + Sync + 'static>> except that the
+  183|       |        // result is a thin pointer. The necessary behavior for manipulating the
+  184|       |        // underlying ErrorImpl<E> is preserved in the vtable provided by the
+  185|       |        // caller rather than a builtin fat pointer vtable.
+  186|       |        let erased = mem::transmute::<Box<ErrorImpl<E, C>>, Box<ErrorImpl<(), C>>>(inner);
+  187|       |        let inner = ManuallyDrop::new(erased);
+  188|       |        Report { inner }
+  189|       |    }
+  190|       |
+  191|       |    /// Create a new error from an error message to wrap the existing error.
+  192|       |    ///
+  193|       |    /// For attaching a higher level error message to a `Result` as it is propagated, the
+  194|       |    /// [`WrapErr`][crate::WrapErr] extension trait may be more convenient than this function.
+  195|       |    ///
+  196|       |    /// The primary reason to use `error.wrap_err(...)` instead of `result.wrap_err(...)` via the
+  197|       |    /// `WrapErr` trait would be if the message needs to depend on some data held by the underlying
+  198|       |    /// error:
+  199|       |    ///
+  200|       |    /// ```
+  201|       |    /// # use std::fmt::{self, Debug, Display};
+  202|       |    /// #
+  203|       |    /// # type T = ();
+  204|       |    /// #
+  205|       |    /// # impl std::error::Error for ParseError {}
+  206|       |    /// # impl Debug for ParseError {
+  207|       |    /// #     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+  208|       |    /// #         unimplemented!()
+  209|       |    /// #     }
+  210|       |    /// # }
+  211|       |    /// # impl Display for ParseError {
+  212|       |    /// #     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+  213|       |    /// #         unimplemented!()
+  214|       |    /// #     }
+  215|       |    /// # }
+  216|       |    /// #
+  217|       |    /// use eyre::Result;
+  218|       |    /// use std::fs::File;
+  219|       |    /// use std::path::Path;
+  220|       |    ///
+  221|       |    /// struct ParseError {
+  222|       |    ///     line: usize,
+  223|       |    ///     column: usize,
+  224|       |    /// }
+  225|       |    ///
+  226|       |    /// fn parse_impl(file: File) -> Result<T, ParseError> {
+  227|       |    ///     # const IGNORE: &str = stringify! {
+  228|       |    ///     ...
+  229|       |    ///     # };
+  230|       |    ///     # unimplemented!()
+  231|       |    /// }
+  232|       |    ///
+  233|       |    /// pub fn parse(path: impl AsRef<Path>) -> Result<T> {
+  234|       |    ///     let file = File::open(&path)?;
+  235|       |    ///     parse_impl(file).map_err(|error| {
+  236|       |    ///         let message = format!(
+  237|       |    ///             "only the first {} lines of {} are valid",
+  238|       |    ///             error.line, path.as_ref().display(),
+  239|       |    ///         );
+  240|       |    ///         eyre::Report::new(error).wrap_err(message)
+  241|       |    ///     })
+  242|       |    /// }
+  243|       |    /// ```
+  244|       |    pub fn wrap_err<D>(mut self, msg: D) -> Self
+  245|       |    where
+  246|       |        D: Display + Send + Sync + 'static,
+  247|       |    {
+  248|       |        let context = self.inner.context.take();
+  249|       |        let error: ContextError<D, Report<C>> = ContextError { msg, error: self };
+  250|       |
+  251|       |        let vtable = &ErrorVTable {
+  252|       |            object_drop: object_drop::<ContextError<D, Report<C>>, C>,
+  253|       |            object_ref: object_ref::<ContextError<D, Report<C>>, C>,
+  254|       |            #[cfg(feature = "std")]
+  255|       |            object_mut: object_mut::<ContextError<D, Report<C>>, C>,
+  256|       |            object_boxed: object_boxed::<ContextError<D, Report<C>>, C>,
+  257|       |            object_downcast: context_chain_downcast::<D, C>,
+  258|       |            object_drop_rest: context_chain_drop_rest::<D, C>,
+  259|       |        };
+  260|       |
+  261|       |        // Safety: passing vtable that operates on the right type.
+  262|       |        unsafe { Report::construct(error, vtable, context) }
+  263|       |    }
+  264|       |
+  265|       |    /// Get the backtrace for this Report.
+  266|       |    ///
+  267|       |    /// Backtraces are only available on the nightly channel. Tracking issue:
+  268|       |    /// [rust-lang/rust#53487][tracking].
+  269|       |    ///
+  270|       |    /// In order for the backtrace to be meaningful, one of the two environment
+  271|       |    /// variables `RUST_LIB_BACKTRACE=1` or `RUST_BACKTRACE=1` must be defined
+  272|       |    /// and `RUST_LIB_BACKTRACE` must not be `0`. Backtraces are somewhat
+  273|       |    /// expensive to capture in Rust, so we don't necessarily want to be
+  274|       |    /// capturing them all over the place all the time.
+  275|       |    ///
+  276|       |    /// - If you want panics and errors to both have backtraces, set
+  277|       |    ///   `RUST_BACKTRACE=1`;
+  278|       |    /// - If you want only errors to have backtraces, set
+  279|       |    ///   `RUST_LIB_BACKTRACE=1`;
+  280|       |    /// - If you want only panics to have backtraces, set `RUST_BACKTRACE=1` and
+  281|       |    ///   `RUST_LIB_BACKTRACE=0`.
+  282|       |    ///
+  283|       |    /// [tracking]: https://github.com/rust-lang/rust/issues/53487
+  284|       |    #[cfg(backtrace)]
+  285|       |    pub fn backtrace(&self) -> &Backtrace {
+  286|       |        self.inner.backtrace()
+  287|       |    }
+  288|       |
+  289|       |    /// An iterator of the chain of source errors contained by this Report.
+  290|       |    ///
+  291|       |    /// This iterator will visit every error in the cause chain of this error
+  292|       |    /// object, beginning with the error that this error object was created
+  293|       |    /// from.
+  294|       |    ///
+  295|       |    /// # Example
+  296|       |    ///
+  297|       |    /// ```
+  298|       |    /// use eyre::Report;
+  299|       |    /// use std::io;
+  300|       |    ///
+  301|       |    /// pub fn underlying_io_error_kind(error: &Report) -> Option<io::ErrorKind> {
+  302|       |    ///     for cause in error.chain() {
+  303|       |    ///         if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+  304|       |    ///             return Some(io_error.kind());
+  305|       |    ///         }
+  306|       |    ///     }
+  307|       |    ///     None
+  308|       |    /// }
+  309|       |    /// ```
+  310|       |    #[cfg(feature = "std")]
+  311|       |    pub fn chain(&self) -> Chain {
+  312|       |        self.inner.chain()
+  313|       |    }
+  314|       |
+  315|       |    /// The lowest level cause of this error &mdash; this error's cause's
+  316|       |    /// cause's cause etc.
+  317|       |    ///
+  318|       |    /// The root cause is the last error in the iterator produced by
+  319|       |    /// [`chain()`][Report::chain].
+  320|       |    #[cfg(feature = "std")]
+  321|       |    pub fn root_cause(&self) -> &(dyn StdError + 'static) {
+  322|       |        let mut chain = self.chain();
+  323|       |        let mut root_cause = chain.next().unwrap();
+  324|       |        for cause in chain {
+  325|       |            root_cause = cause;
+  326|       |        }
+  327|       |        root_cause
+  328|       |    }
+  329|       |
+  330|       |    /// Returns true if `E` is the type held by this error object.
+  331|       |    ///
+  332|       |    /// For errors constructed from messages, this method returns true if `E` matches the type of
+  333|       |    /// the message `D` **or** the type of the error on which the message has been attached. For
+  334|       |    /// details about the interaction between message and downcasting, [see here].
+  335|       |    ///
+  336|       |    /// [see here]: trait.WrapErr.html#effect-on-downcasting
+  337|       |    pub fn is<E>(&self) -> bool
+  338|       |    where
+  339|       |        E: Display + Debug + Send + Sync + 'static,
+  340|       |    {
+  341|       |        self.downcast_ref::<E>().is_some()
+  342|       |    }
+  343|       |
+  344|       |    /// Attempt to downcast the error object to a concrete type.
+  345|       |    pub fn downcast<E>(self) -> Result<E, Self>
+  346|       |    where
+  347|       |        E: Display + Debug + Send + Sync + 'static,
+  348|       |    {
+  349|       |        let target = TypeId::of::<E>();
+  350|       |        unsafe {
+  351|       |            // Use vtable to find NonNull<()> which points to a value of type E
+  352|       |            // somewhere inside the data structure.
+  353|       |            let addr = match (self.inner.vtable.object_downcast)(&self.inner, target) {
+  354|       |                Some(addr) => addr,
+  355|       |                None => return Err(self),
+  356|       |            };
+  357|       |
+  358|       |            // Prepare to read E out of the data structure. We'll drop the rest
+  359|       |            // of the data structure separately so that E is not dropped.
+  360|       |            let outer = ManuallyDrop::new(self);
+  361|       |
+  362|       |            // Read E from where the vtable found it.
+  363|       |            let error = ptr::read(addr.cast::<E>().as_ptr());
+  364|       |
+  365|       |            // Read Box<ErrorImpl<()>> from self. Can't move it out because
+  366|       |            // Report has a Drop impl which we want to not run.
+  367|       |            let inner = ptr::read(&outer.inner);
+  368|       |            let erased = ManuallyDrop::into_inner(inner);
+  369|       |
+  370|       |            // Drop rest of the data structure outside of E.
+  371|       |            (erased.vtable.object_drop_rest)(erased, target);
+  372|       |
+  373|       |            Ok(error)
+  374|       |        }
+  375|       |    }
+  376|       |
+  377|       |    /// Downcast this error object by reference.
+  378|       |    ///
+  379|       |    /// # Example
+  380|       |    ///
+  381|       |    /// ```
+  382|       |    /// # use eyre::{Report, eyre};
+  383|       |    /// # use std::fmt::{self, Display};
+  384|       |    /// # use std::task::Poll;
+  385|       |    /// #
+  386|       |    /// # #[derive(Debug)]
+  387|       |    /// # enum DataStoreError {
+  388|       |    /// #     Censored(()),
+  389|       |    /// # }
+  390|       |    /// #
+  391|       |    /// # impl Display for DataStoreError {
+  392|       |    /// #     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+  393|       |    /// #         unimplemented!()
+  394|       |    /// #     }
+  395|       |    /// # }
+  396|       |    /// #
+  397|       |    /// # impl std::error::Error for DataStoreError {}
+  398|       |    /// #
+  399|       |    /// # const REDACTED_CONTENT: () = ();
+  400|       |    /// #
+  401|       |    /// # let error: Report = eyre!("...");
+  402|       |    /// # let root_cause = &error;
+  403|       |    /// #
+  404|       |    /// # let ret =
+  405|       |    /// // If the error was caused by redaction, then return a tombstone instead
+  406|       |    /// // of the content.
+  407|       |    /// match root_cause.downcast_ref::<DataStoreError>() {
+  408|       |    ///     Some(DataStoreError::Censored(_)) => Ok(Poll::Ready(REDACTED_CONTENT)),
+  409|       |    ///     None => Err(error),
+  410|       |    /// }
+  411|       |    /// # ;
+  412|       |    /// ```
+  413|       |    pub fn downcast_ref<E>(&self) -> Option<&E>
+  414|       |    where
+  415|       |        E: Display + Debug + Send + Sync + 'static,
+  416|       |    {
+  417|       |        let target = TypeId::of::<E>();
+  418|       |        unsafe {
+  419|       |            // Use vtable to find NonNull<()> which points to a value of type E
+  420|       |            // somewhere inside the data structure.
+  421|       |            let addr = (self.inner.vtable.object_downcast)(&self.inner, target)?;
+  422|       |            Some(&*addr.cast::<E>().as_ptr())
+  423|       |        }
+  424|       |    }
+  425|       |
+  426|       |    /// Downcast this error object by mutable reference.
+  427|       |    pub fn downcast_mut<E>(&mut self) -> Option<&mut E>
+  428|       |    where
+  429|       |        E: Display + Debug + Send + Sync + 'static,
+  430|       |    {
+  431|       |        let target = TypeId::of::<E>();
+  432|       |        unsafe {
+  433|       |            // Use vtable to find NonNull<()> which points to a value of type E
+  434|       |            // somewhere inside the data structure.
+  435|       |            let addr = (self.inner.vtable.object_downcast)(&self.inner, target)?;
+  436|       |            Some(&mut *addr.cast::<E>().as_ptr())
+  437|       |        }
+  438|       |    }
+  439|       |
+  440|       |    pub fn member_ref<T: Any>(&self) -> Option<&T> {
+  441|       |        self.inner.member_ref()
+  442|       |    }
+  443|       |
+  444|       |    pub fn member_mut<T: Any>(&mut self) -> Option<&mut T> {
+  445|       |        self.inner.member_mut()
+  446|       |    }
+  447|       |
+  448|       |    pub fn context(&self) -> &C {
+  449|       |        self.inner.context.as_ref().unwrap()
+  450|       |    }
+  451|       |
+  452|       |    pub fn context_mut(&mut self) -> &mut C {
+  453|       |        self.inner.context.as_mut().unwrap()
+  454|       |    }
+  455|       |}
+  456|       |
+  457|       |#[cfg(feature = "std")]
+  458|       |impl<E, C> From<E> for Report<C>
+  459|       |where
+  460|       |    C: EyreContext,
+  461|       |    E: StdError + Send + Sync + 'static,
+  462|       |{
+  463|       |    fn from(error: E) -> Self {
+  464|       |        Report::from_std(error)
+  465|       |    }
+  466|       |}
+  467|       |
+  468|       |#[cfg(feature = "std")]
+  469|       |impl<C: EyreContext> Deref for Report<C> {
+  470|       |    type Target = dyn StdError + Send + Sync + 'static;
+  471|       |
+  472|       |    fn deref(&self) -> &Self::Target {
+  473|       |        self.inner.error()
+  474|       |    }
+  475|       |}
+  476|       |
+  477|       |#[cfg(feature = "std")]
+  478|       |impl<C: EyreContext> DerefMut for Report<C> {
+  479|       |    fn deref_mut(&mut self) -> &mut Self::Target {
+  480|       |        self.inner.error_mut()
+  481|       |    }
+  482|       |}
+  483|       |
+  484|       |impl<C: EyreContext> Display for Report<C> {
+  485|       |    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+  486|       |        self.inner.display(formatter)
+  487|       |    }
+  488|       |}
+  489|       |
+  490|       |impl<C: EyreContext> Debug for Report<C> {
+  491|       |    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+  492|       |        self.inner.debug(formatter)
+  493|       |    }
+  494|       |}
+  495|       |
+  496|       |impl<C> Drop for Report<C>
+  497|       |where
+  498|       |    C: EyreContext,
+  499|       |{
+  500|       |    fn drop(&mut self) {
+  501|       |        unsafe {
+  502|       |            // Read Box<ErrorImpl<()>> from self.
+  503|       |            let inner = ptr::read(&self.inner);
+  504|       |            let erased = ManuallyDrop::into_inner(inner);
+  505|       |
+  506|       |            // Invoke the vtable's drop behavior.
+  507|       |            (erased.vtable.object_drop)(erased);
+  508|       |        }
+  509|       |    }
+  510|       |}
+  511|       |
+  512|       |struct ErrorVTable<C>
+  513|       |where
+  514|       |    C: EyreContext,
+  515|       |{
+  516|       |    object_drop: unsafe fn(Box<ErrorImpl<(), C>>),
+  517|       |    object_ref: unsafe fn(&ErrorImpl<(), C>) -> &(dyn StdError + Send + Sync + 'static),
+  518|       |    #[cfg(feature = "std")]
+  519|       |    object_mut: unsafe fn(&mut ErrorImpl<(), C>) -> &mut (dyn StdError + Send + Sync + 'static),
+  520|       |    #[allow(clippy::type_complexity)]
+  521|       |    object_boxed: unsafe fn(Box<ErrorImpl<(), C>>) -> Box<dyn StdError + Send + Sync + 'static>,
+  522|       |    object_downcast: unsafe fn(&ErrorImpl<(), C>, TypeId) -> Option<NonNull<()>>,
+  523|       |    object_drop_rest: unsafe fn(Box<ErrorImpl<(), C>>, TypeId),
+  524|       |}
+  525|       |
+  526|       |// Safety: requires layout of *e to match ErrorImpl<E>.
+  527|       |unsafe fn object_drop<E, C>(e: Box<ErrorImpl<(), C>>)
+  528|       |where
+  529|       |    C: EyreContext,
+  530|       |{
+  531|       |    // Cast back to ErrorImpl<E> so that the allocator receives the correct
+  532|       |    // Layout to deallocate the Box's memory.
+  533|       |    let unerased = mem::transmute::<Box<ErrorImpl<(), C>>, Box<ErrorImpl<E, C>>>(e);
+  534|       |    drop(unerased);
+  535|       |}
+  536|       |
+  537|       |// Safety: requires layout of *e to match ErrorImpl<E>.
+  538|       |unsafe fn object_drop_front<E, C>(e: Box<ErrorImpl<(), C>>, target: TypeId)
+  539|       |where
+  540|       |    C: EyreContext,
+  541|       |{
+  542|       |    // Drop the fields of ErrorImpl other than E as well as the Box allocation,
+  543|       |    // without dropping E itself. This is used by downcast after doing a
+  544|       |    // ptr::read to take ownership of the E.
+  545|       |    let _ = target;
+  546|       |    let unerased = mem::transmute::<Box<ErrorImpl<(), C>>, Box<ErrorImpl<ManuallyDrop<E>, C>>>(e);
+  547|       |    drop(unerased);
+  548|       |}
+  549|       |
+  550|       |// Safety: requires layout of *e to match ErrorImpl<E>.
+  551|       |unsafe fn object_ref<E, C>(e: &ErrorImpl<(), C>) -> &(dyn StdError + Send + Sync + 'static)
+  552|       |where
+  553|       |    C: EyreContext,
+  554|       |    E: StdError + Send + Sync + 'static,
+  555|       |{
+  556|       |    // Attach E's native StdError vtable onto a pointer to self._object.
+  557|       |    &(*(e as *const ErrorImpl<(), C> as *const ErrorImpl<E, C>))._object
+  558|       |}
+  559|       |
+  560|       |// Safety: requires layout of *e to match ErrorImpl<E>.
+  561|       |#[cfg(feature = "std")]
+  562|       |unsafe fn object_mut<E, C>(e: &mut ErrorImpl<(), C>) -> &mut (dyn StdError + Send + Sync + 'static)
+  563|       |where
+  564|       |    C: EyreContext,
+  565|       |    E: StdError + Send + Sync + 'static,
+  566|       |{
+  567|       |    // Attach E's native StdError vtable onto a pointer to self._object.
+  568|       |    &mut (*(e as *mut ErrorImpl<(), C> as *mut ErrorImpl<E, C>))._object
+  569|       |}
+  570|       |
+  571|       |// Safety: requires layout of *e to match ErrorImpl<E>.
+  572|       |unsafe fn object_boxed<E, C>(e: Box<ErrorImpl<(), C>>) -> Box<dyn StdError + Send + Sync + 'static>
+  573|       |where
+  574|       |    C: EyreContext,
+  575|       |    E: StdError + Send + Sync + 'static,
+  576|       |    C: Send + Sync + 'static,
+  577|       |{
+  578|       |    // Attach ErrorImpl<E>'s native StdError vtable. The StdError impl is below.
+  579|       |    mem::transmute::<Box<ErrorImpl<(), C>>, Box<ErrorImpl<E, C>>>(e)
+  580|       |}
+  581|       |
+  582|       |// Safety: requires layout of *e to match ErrorImpl<E>.
+  583|       |unsafe fn object_downcast<E, C>(e: &ErrorImpl<(), C>, target: TypeId) -> Option<NonNull<()>>
+  584|       |where
+  585|       |    C: EyreContext,
+  586|       |    E: 'static,
+  587|       |{
+  588|      0|    if TypeId::of::<E>() == target {
+  589|       |        // Caller is looking for an E pointer and e is ErrorImpl<E>, take a
+  590|       |        // pointer to its E field.
+  591|      0|        let unerased = e as *const ErrorImpl<(), C> as *const ErrorImpl<E, C>;
+  592|      0|        let addr = &(*unerased)._object as *const E as *mut ();
+  593|      0|        Some(NonNull::new_unchecked(addr))
+  594|       |    } else {
+  595|      0|        None
+  596|       |    }
+  597|      0|}
+  598|       |
+  599|       |// Safety: requires layout of *e to match ErrorImpl<ContextError<D, E>>.
+  600|       |#[cfg(feature = "std")]
+  601|       |unsafe fn context_downcast<D, E, C>(e: &ErrorImpl<(), C>, target: TypeId) -> Option<NonNull<()>>
+  602|       |where
+  603|       |    C: EyreContext,
+  604|       |    D: 'static,
+  605|       |    E: 'static,
+  606|       |{
+  607|       |    if TypeId::of::<D>() == target {
+  608|       |        let unerased = e as *const ErrorImpl<(), C> as *const ErrorImpl<ContextError<D, E>, C>;
+  609|       |        let addr = &(*unerased)._object.msg as *const D as *mut ();
+  610|       |        Some(NonNull::new_unchecked(addr))
+  611|       |    } else if TypeId::of::<E>() == target {
+  612|       |        let unerased = e as *const ErrorImpl<(), C> as *const ErrorImpl<ContextError<D, E>, C>;
+  613|       |        let addr = &(*unerased)._object.error as *const E as *mut ();
+  614|       |        Some(NonNull::new_unchecked(addr))
+  615|       |    } else {
+  616|       |        None
+  617|       |    }
+  618|       |}
+  619|       |
+  620|       |// Safety: requires layout of *e to match ErrorImpl<ContextError<D, E>>.
+  621|       |#[cfg(feature = "std")]
+  622|       |unsafe fn context_drop_rest<D, E, C>(e: Box<ErrorImpl<(), C>>, target: TypeId)
+  623|       |where
+  624|       |    C: EyreContext,
+  625|       |    D: 'static,
+  626|       |    E: 'static,
+  627|       |{
+  628|       |    // Called after downcasting by value to either the D or the E and doing a
+  629|       |    // ptr::read to take ownership of that value.
+  630|       |    if TypeId::of::<D>() == target {
+  631|       |        let unerased = mem::transmute::<
+  632|       |            Box<ErrorImpl<(), C>>,
+  633|       |            Box<ErrorImpl<ContextError<ManuallyDrop<D>, E>, C>>,
+  634|       |        >(e);
+  635|       |        drop(unerased);
+  636|       |    } else {
+  637|       |        let unerased = mem::transmute::<
+  638|       |            Box<ErrorImpl<(), C>>,
+  639|       |            Box<ErrorImpl<ContextError<D, ManuallyDrop<E>>, C>>,
+  640|       |        >(e);
+  641|       |        drop(unerased);
+  642|       |    }
+  643|       |}
+  644|       |
+  645|       |// Safety: requires layout of *e to match ErrorImpl<ContextError<D, Report>>.
+  646|       |unsafe fn context_chain_downcast<D, C>(e: &ErrorImpl<(), C>, target: TypeId) -> Option<NonNull<()>>
+  647|       |where
+  648|       |    C: EyreContext,
+  649|       |    D: 'static,
+  650|       |{
+  651|       |    if TypeId::of::<D>() == target {
+  652|       |        let unerased =
+  653|       |            e as *const ErrorImpl<(), C> as *const ErrorImpl<ContextError<D, Report<C>>, C>;
+  654|       |        let addr = &(*unerased)._object.msg as *const D as *mut ();
+  655|       |        Some(NonNull::new_unchecked(addr))
+  656|       |    } else {
+  657|       |        // Recurse down the context chain per the inner error's vtable.
+  658|       |        let unerased =
+  659|       |            e as *const ErrorImpl<(), C> as *const ErrorImpl<ContextError<D, Report<C>>, C>;
+  660|       |        let source = &(*unerased)._object.error;
+  661|       |        (source.inner.vtable.object_downcast)(&source.inner, target)
+  662|       |    }
+  663|       |}
+  664|       |
+  665|       |// Safety: requires layout of *e to match ErrorImpl<ContextError<D, Report>>.
+  666|       |unsafe fn context_chain_drop_rest<D, C>(e: Box<ErrorImpl<(), C>>, target: TypeId)
+  667|       |where
+  668|       |    C: EyreContext,
+  669|       |    D: 'static,
+  670|       |{
+  671|       |    // Called after downcasting by value to either the D or one of the causes
+  672|       |    // and doing a ptr::read to take ownership of that value.
+  673|       |    if TypeId::of::<D>() == target {
+  674|       |        let unerased = mem::transmute::<
+  675|       |            Box<ErrorImpl<(), C>>,
+  676|       |            Box<ErrorImpl<ContextError<ManuallyDrop<D>, Report<C>>, C>>,
+  677|       |        >(e);
+  678|       |        // Drop the entire rest of the data structure rooted in the next Report.
+  679|       |        drop(unerased);
+  680|       |    } else {
+  681|       |        let unerased = mem::transmute::<
+  682|       |            Box<ErrorImpl<(), C>>,
+  683|       |            Box<ErrorImpl<ContextError<D, ManuallyDrop<Report<C>>>, C>>,
+  684|       |        >(e);
+  685|       |        // Read out a ManuallyDrop<Box<ErrorImpl<()>>> from the next error.
+  686|       |        let inner = ptr::read(&unerased._object.error.inner);
+  687|       |        drop(unerased);
+  688|       |        let erased = ManuallyDrop::into_inner(inner);
+  689|       |        // Recursively drop the next error using the same target typeid.
+  690|       |        (erased.vtable.object_drop_rest)(erased, target);
+  691|       |    }
+  692|       |}
+  693|       |
+  694|       |// repr C to ensure that E remains in the final position.
+  695|       |#[repr(C)]
+  696|       |pub(crate) struct ErrorImpl<E, C>
+  697|       |where
+  698|       |    C: EyreContext,
+  699|       |{
+  700|       |    vtable: &'static ErrorVTable<C>,
+  701|       |    pub(crate) context: Option<C>,
+  702|       |    // NOTE: Don't use directly. Use only through vtable. Erased type may have
+  703|       |    // different alignment.
+  704|       |    _object: E,
+  705|       |}
+  706|       |
+  707|       |// repr C to ensure that ContextError<D, E> has the same layout as
+  708|       |// ContextError<ManuallyDrop<D>, E> and ContextError<D, ManuallyDrop<E>>.
+  709|       |#[repr(C)]
+  710|       |pub(crate) struct ContextError<D, E> {
+  711|       |    pub msg: D,
+  712|       |    pub error: E,
+  713|       |}
+  714|       |
+  715|       |impl<E, C> ErrorImpl<E, C>
+  716|       |where
+  717|       |    C: EyreContext,
+  718|       |{
+  719|       |    fn erase(&self) -> &ErrorImpl<(), C> {
+  720|       |        // Erase the concrete type of E but preserve the vtable in self.vtable
+  721|       |        // for manipulating the resulting thin pointer. This is analogous to an
+  722|       |        // unsize coersion.
+  723|       |        unsafe { &*(self as *const ErrorImpl<E, C> as *const ErrorImpl<(), C>) }
+  724|       |    }
+  725|       |}
+  726|       |
+  727|       |impl<C> ErrorImpl<(), C>
+  728|       |where
+  729|       |    C: EyreContext,
+  730|       |{
+  731|       |    pub(crate) fn error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+  732|       |        // Use vtable to attach E's native StdError vtable for the right
+  733|       |        // original type E.
+  734|       |        unsafe { &*(self.vtable.object_ref)(self) }
+  735|       |    }
+  736|       |
+  737|       |    #[cfg(feature = "std")]
+  738|       |    pub(crate) fn error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+  739|       |        // Use vtable to attach E's native StdError vtable for the right
+  740|       |        // original type E.
+  741|       |        unsafe { &mut *(self.vtable.object_mut)(self) }
+  742|       |    }
+  743|       |
+  744|       |    pub fn member_ref<T: Any>(&self) -> Option<&T> {
+  745|       |        self.context
+  746|       |            .as_ref()
+  747|       |            .unwrap()
+  748|       |            .member_ref(TypeId::of::<T>())?
+  749|       |            .downcast_ref::<T>()
+  750|       |    }
+  751|       |
+  752|       |    pub fn member_mut<T: Any>(&mut self) -> Option<&mut T> {
+  753|       |        self.context
+  754|       |            .as_mut()
+  755|       |            .unwrap()
+  756|       |            .member_mut(TypeId::of::<T>())?
+  757|       |            .downcast_mut::<T>()
+  758|       |    }
+  759|       |
+  760|       |    #[cfg(backtrace)]
+  761|       |    pub(crate) fn backtrace(&self) -> &Backtrace {
+  762|       |        // This unwrap can only panic if the underlying error's backtrace method
+  763|       |        // is nondeterministic, which would only happen in maliciously
+  764|       |        // constructed code.
+  765|      0|        self.member_ref()
+  766|      0|            .or_else(|| self.error().backtrace())
+  767|      0|            .expect("backtrace capture failed")
+  768|      0|    }
+  769|       |
+  770|       |    pub(crate) fn chain(&self) -> Chain {
+  771|       |        Chain::new(self.error())
+  772|       |    }
+  773|       |}
+  774|       |
+  775|       |impl<E, C> StdError for ErrorImpl<E, C>
+  776|       |where
+  777|       |    C: EyreContext,
+  778|       |    E: StdError,
+  779|       |{
+  780|       |    #[cfg(backtrace)]
+  781|       |    fn backtrace(&self) -> Option<&Backtrace> {
+  782|       |        Some(self.erase().backtrace())
+  783|       |    }
+  784|       |
+  785|       |    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+  786|       |        self.erase().error().source()
+  787|       |    }
+  788|       |}
+  789|       |
+  790|       |impl<E, C> Debug for ErrorImpl<E, C>
+  791|       |where
+  792|       |    C: EyreContext,
+  793|       |    E: Debug,
+  794|       |{
+  795|       |    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+  796|       |        self.erase().debug(formatter)
+  797|       |    }
+  798|       |}
+  799|       |
+  800|       |impl<E, C> Display for ErrorImpl<E, C>
+  801|       |where
+  802|       |    C: EyreContext,
+  803|       |    E: Display,
+  804|       |{
+  805|       |    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+  806|       |        Display::fmt(&self.erase().error(), formatter)
+  807|       |    }
+  808|       |}
+  809|       |
+  810|       |impl<C: EyreContext> From<Report<C>> for Box<dyn StdError + Send + Sync + 'static> {
+  811|       |    fn from(error: Report<C>) -> Self {
+  812|       |        let outer = ManuallyDrop::new(error);
+  813|       |        unsafe {
+  814|       |            // Read Box<ErrorImpl<()>> from error. Can't move it out because
+  815|       |            // Report has a Drop impl which we want to not run.
+  816|       |            let inner = ptr::read(&outer.inner);
+  817|       |            let erased = ManuallyDrop::into_inner(inner);
+  818|       |
+  819|       |            // Use vtable to attach ErrorImpl<E>'s native StdError vtable for
+  820|       |            // the right original type E.
+  821|       |            (erased.vtable.object_boxed)(erased)
+  822|       |        }
+  823|       |    }
+  824|       |}
+  825|       |
+  826|       |impl<C: EyreContext> From<Report<C>> for Box<dyn StdError + 'static> {
+  827|       |    fn from(error: Report<C>) -> Self {
+  828|       |        Box::<dyn StdError + Send + Sync>::from(error)
+  829|       |    }
+  830|       |}
+  831|       |
+  832|       |#[cfg(feature = "std")]
+  833|       |impl<C: EyreContext> AsRef<dyn StdError + Send + Sync> for Report<C> {
+  834|       |    fn as_ref(&self) -> &(dyn StdError + Send + Sync + 'static) {
+  835|       |        &**self
+  836|       |    }
+  837|       |}
+  838|       |
+  839|       |#[cfg(feature = "std")]
+  840|       |impl<C: EyreContext> AsRef<dyn StdError> for Report<C> {
+  841|       |    fn as_ref(&self) -> &(dyn StdError + 'static) {
+  842|       |        &**self
+  843|       |    }
+  844|       |}
+
+/home/jlusby/.cargo/registry/src/github.com-1ecc6299db9ec823/eyre-0.3.10/src/fmt.rs:
+    1|       |use crate::error::ErrorImpl;
+    2|       |use crate::EyreContext;
+    3|       |use core::fmt;
+    4|       |
+    5|       |impl<C> ErrorImpl<(), C>
+    6|       |where
+    7|       |    C: EyreContext,
+    8|       |{
+    9|       |    pub(crate) fn display(&self, f: &mut fmt::Formatter) -> fmt::Result {
+   10|       |        self.context
+   11|       |            .as_ref()
+   12|       |            .map(|context| context.display(self.error(), f))
+   13|       |            .unwrap_or_else(|| std::fmt::Display::fmt(self.error(), f))
+   14|       |    }
+   15|       |
+   16|       |    pub(crate) fn debug(&self, f: &mut fmt::Formatter) -> fmt::Result {
+   17|      0|        self.context
+   18|      0|            .as_ref()
+   19|      0|            .map(|context| context.debug(self.error(), f))
+   20|      0|            .unwrap_or_else(|| std::fmt::Debug::fmt(self.error(), f))
+   21|      0|    }
+   22|       |}
+
+/home/jlusby/.cargo/registry/src/github.com-1ecc6299db9ec823/eyre-0.3.10/src/lib.rs:
+    1|       |//! This library provides [`eyre::Report`][Report], a trait object based error
+    2|       |//! type for easy idiomatic error handling in Rust applications.
+    3|       |//!
+    4|       |//! This crate is a fork of [`anyhow`] by @dtolnay with a support for customized `Reports`. For
+    5|       |//! more details on customization checkout the docs on [`eyre::EyreContext`]. For an example on how
+    6|       |//! to implement a custom context check out [`stable-eyre`] which implements a minimal custom
+    7|       |//! context for capturing backtraces on stable.
+    8|       |//!
+    9|       |//! ```toml
+   10|       |//! [dependencies]
+   11|       |//! eyre = "0.3"
+   12|       |//! ```
+   13|       |//! # Details
+   14|       |//!
+   15|       |//! - Use `Result<T, eyre::Report>`, or equivalently `eyre::Result<T>`, as
+   16|       |//!   the return type of any fallible function.
+   17|       |//!
+   18|       |//!   Within the function, use `?` to easily propagate any error that implements
+   19|       |//!   the `std::error::Report` trait.
+   20|       |//!
+   21|       |//!   ```
+   22|       |//!   # pub trait Deserialize {}
+   23|       |//!   #
+   24|       |//!   # mod serde_json {
+   25|       |//!   #     use super::Deserialize;
+   26|       |//!   #     use std::io;
+   27|       |//!   #
+   28|       |//!   #     pub fn from_str<T: Deserialize>(json: &str) -> io::Result<T> {
+   29|       |//!   #         unimplemented!()
+   30|       |//!   #     }
+   31|       |//!   # }
+   32|       |//!   #
+   33|       |//!   # struct ClusterMap;
+   34|       |//!   #
+   35|       |//!   # impl Deserialize for ClusterMap {}
+   36|       |//!   #
+   37|       |//!   use eyre::Result;
+   38|       |//!
+   39|       |//!   fn get_cluster_info() -> Result<ClusterMap> {
+   40|       |//!       let config = std::fs::read_to_string("cluster.json")?;
+   41|       |//!       let map: ClusterMap = serde_json::from_str(&config)?;
+   42|       |//!       Ok(map)
+   43|       |//!   }
+   44|       |//!   #
+   45|       |//!   # fn main() {}
+   46|       |//!   ```
+   47|       |//!
+   48|       |//! - Create new errors from messages to help the person troubleshooting the error understand where
+   49|       |//! things went wrong. A low-level error like "No such file or directory" can be annoying to
+   50|       |//! directly and often benefit from being wrapped with higher level error messages.
+   51|       |//!
+   52|       |//!   ```
+   53|       |//!   # struct It;
+   54|       |//!   #
+   55|       |//!   # impl It {
+   56|       |//!   #     fn detach(&self) -> Result<()> {
+   57|       |//!   #         unimplemented!()
+   58|       |//!   #     }
+   59|       |//!   # }
+   60|       |//!   #
+   61|       |//!   use eyre::{WrapErr, Result};
+   62|       |//!
+   63|       |//!   fn main() -> Result<()> {
+   64|       |//!       # return Ok(());
+   65|       |//!       #
+   66|       |//!       # const _: &str = stringify! {
+   67|       |//!       ...
+   68|       |//!       # };
+   69|       |//!       #
+   70|       |//!       # let it = It;
+   71|       |//!       # let path = "./path/to/instrs.json";
+   72|       |//!       #
+   73|       |//!       it.detach().wrap_err("Failed to detach the important thing")?;
+   74|       |//!
+   75|       |//!       let content = std::fs::read(path)
+   76|       |//!           .wrap_err_with(|| format!("Failed to read instrs from {}", path))?;
+   77|       |//!       #
+   78|       |//!       # const _: &str = stringify! {
+   79|       |//!       ...
+   80|       |//!       # };
+   81|       |//!       #
+   82|       |//!       # Ok(())
+   83|       |//!   }
+   84|       |//!   ```
+   85|       |//!
+   86|       |//!   ```console
+   87|       |//!   Error: Failed to read instrs from ./path/to/instrs.json
+   88|       |//!
+   89|       |//!   Caused by:
+   90|       |//!       No such file or directory (os error 2)
+   91|       |//!   ```
+   92|       |//!
+   93|       |//! - Downcasting is supported and can be by value, by shared reference, or by
+   94|       |//!   mutable reference as needed.
+   95|       |//!
+   96|       |//!   ```
+   97|       |//!   # use eyre::{Report, eyre};
+   98|       |//!   # use std::fmt::{self, Display};
+   99|       |//!   # use std::task::Poll;
+  100|       |//!   #
+  101|       |//!   # #[derive(Debug)]
+  102|       |//!   # enum DataStoreError {
+  103|       |//!   #     Censored(()),
+  104|       |//!   # }
+  105|       |//!   #
+  106|       |//!   # impl Display for DataStoreError {
+  107|       |//!   #     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+  108|       |//!   #         unimplemented!()
+  109|       |//!   #     }
+  110|       |//!   # }
+  111|       |//!   #
+  112|       |//!   # impl std::error::Error for DataStoreError {}
+  113|       |//!   #
+  114|       |//!   # const REDACTED_CONTENT: () = ();
+  115|       |//!   #
+  116|       |//!   # let error: Report = eyre!("...");
+  117|       |//!   # let root_cause = &error;
+  118|       |//!   #
+  119|       |//!   # let ret =
+  120|       |//!   // If the error was caused by redaction, then return a
+  121|       |//!   // tombstone instead of the content.
+  122|       |//!   match root_cause.downcast_ref::<DataStoreError>() {
+  123|       |//!       Some(DataStoreError::Censored(_)) => Ok(Poll::Ready(REDACTED_CONTENT)),
+  124|       |//!       None => Err(error),
+  125|       |//!   }
+  126|       |//!   # ;
+  127|       |//!   ```
+  128|       |//!
+  129|       |//! - If using the nightly channel, a backtrace is captured and printed with the
+  130|       |//!   error if the underlying error type does not already provide its own. In
+  131|       |//!   order to see backtraces, they must be enabled through the environment
+  132|       |//!   variables described in [`std::backtrace`]:
+  133|       |//!
+  134|       |//!   - If you want panics and errors to both have backtraces, set
+  135|       |//!     `RUST_BACKTRACE=1`;
+  136|       |//!   - If you want only errors to have backtraces, set `RUST_LIB_BACKTRACE=1`;
+  137|       |//!   - If you want only panics to have backtraces, set `RUST_BACKTRACE=1` and
+  138|       |//!     `RUST_LIB_BACKTRACE=0`.
+  139|       |//!
+  140|       |//!   The tracking issue for this feature is [rust-lang/rust#53487].
+  141|       |//!
+  142|       |//!   [`std::backtrace`]: https://doc.rust-lang.org/std/backtrace/index.html#environment-variables
+  143|       |//!   [rust-lang/rust#53487]: https://github.com/rust-lang/rust/issues/53487
+  144|       |//!
+  145|       |//! - Eyre works with any error type that has an impl of `std::error::Error`,
+  146|       |//!   including ones defined in your crate. We do not bundle a `derive(Error)`
+  147|       |//!   macro but you can write the impls yourself or use a standalone macro like
+  148|       |//!   [thiserror].
+  149|       |//!
+  150|       |//!   [thiserror]: https://github.com/dtolnay/thiserror
+  151|       |//!
+  152|       |//!   ```
+  153|       |//!   use thiserror::Error;
+  154|       |//!
+  155|       |//!   #[derive(Error, Debug)]
+  156|       |//!   pub enum FormatError {
+  157|       |//!       #[error("Invalid header (expected {expected:?}, got {found:?})")]
+  158|       |//!       InvalidHeader {
+  159|       |//!           expected: String,
+  160|       |//!           found: String,
+  161|       |//!       },
+  162|       |//!       #[error("Missing attribute: {0}")]
+  163|       |//!       MissingAttribute(String),
+  164|       |//!   }
+  165|       |//!   ```
+  166|       |//!
+  167|       |//! - One-off error messages can be constructed using the `eyre!` macro, which
+  168|       |//!   supports string interpolation and produces an `eyre::Report`.
+  169|       |//!
+  170|       |//!   ```
+  171|       |//!   # use eyre::{eyre, Result};
+  172|       |//!   #
+  173|       |//!   # fn demo() -> Result<()> {
+  174|       |//!   #     let missing = "...";
+  175|       |//!   return Err(eyre!("Missing attribute: {}", missing));
+  176|       |//!   #     Ok(())
+  177|       |//!   # }
+  178|       |//!   ```
+  179|       |//!
+  180|       |//! # No-std support
+  181|       |//!
+  182|       |//! In no_std mode, the same API is almost all available and works the same way.
+  183|       |//! To depend on Eyre in no_std mode, disable our default enabled "std"
+  184|       |//! feature in Cargo.toml. A global allocator is required.
+  185|       |//!
+  186|       |//! ```toml
+  187|       |//! [dependencies]
+  188|       |//! eyre = { version = "0.3", default-features = false }
+  189|       |//! ```
+  190|       |//!
+  191|       |//! Since the `?`-based error conversions would normally rely on the
+  192|       |//! `std::error::Report` trait which is only available through std, no_std mode
+  193|       |//! will require an explicit `.map_err(Report::msg)` when working with a
+  194|       |//! non-Eyre error type inside a function that returns Eyre's error type.
+  195|       |//!
+  196|       |//! # Compatibility with `anyhow`
+  197|       |//!
+  198|       |//! This crate does its best to be usable as a drop in replacement of `anyhow` and
+  199|       |//! vice-versa by `re-exporting` all of the renamed APIs with the names used in
+  200|       |//! `anyhow`.
+  201|       |//!
+  202|       |//! It is not 100% compatible because there are some cases where `eyre` encounters
+  203|       |//! type inference errors but it should mostly work as a drop in replacement.
+  204|       |//! Specifically, the following works in anyhow:
+  205|       |//!
+  206|       |//! ```rust,compile_fail
+  207|       |//! // Works
+  208|       |//! let val = get_optional_val.ok_or_else(|| anyhow!("failed to get value")).unwrap();
+  209|       |//! ```
+  210|       |//!
+  211|       |//! Where as with `eyre!` this will fail due to being unable to infer the type for
+  212|       |//! the Context parameter. The solution to this problem, should you encounter it,
+  213|       |//! is to give the compiler a hint for what type it should be resolving to, either
+  214|       |//! via your return type or a type annotation.
+  215|       |//!
+  216|       |//! ```rust,compile_fail
+  217|       |//! // Broken
+  218|       |//! let val = get_optional_val.ok_or_else(|| eyre!("failed to get value")).unwrap();
+  219|       |//!
+  220|       |//! // Works
+  221|       |//! let val: Report = get_optional_val.ok_or_else(|| eyre!("failed to get value")).unwrap();
+  222|       |//! ```
+  223|       |//! [Report]: https://docs.rs/eyre/*/eyre/struct.Report.html
+  224|       |//! [`eyre::EyreContext`]: https://docs.rs/eyre/*/eyre/trait.EyreContext.html
+  225|       |//! [`eyre::WrapErr`]: https://docs.rs/eyre/*/eyre/trait.WrapErr.html
+  226|       |//! [`anyhow::Context`]: https://docs.rs/anyhow/*/anyhow/trait.Context.html
+  227|       |//! [`anyhow`]: https://github.com/dtolnay/anyhow
+  228|       |//! [`tracing_error::SpanTrace`]: https://docs.rs/tracing-error/*/tracing_error/struct.SpanTrace.html
+  229|       |//! [`stable_eyre`]: https://docs.rs/stable-eyre
+  230|       |#![doc(html_root_url = "https://docs.rs/eyre/0.3.10")]
+  231|       |#![cfg_attr(backtrace, feature(backtrace))]
+  232|       |#![cfg_attr(doc_cfg, feature(doc_cfg))]
+  233|       |#![cfg_attr(not(feature = "std"), no_std)]
+  234|       |#![allow(
+  235|       |    clippy::needless_doctest_main,
+  236|       |    clippy::new_ret_no_self,
+  237|       |    clippy::wrong_self_convention
+  238|       |)]
+  239|       |
+  240|       |mod alloc {
+  241|       |    #[cfg(not(feature = "std"))]
+  242|       |    extern crate alloc;
+  243|       |
+  244|       |    #[cfg(not(feature = "std"))]
+  245|       |    pub use alloc::boxed::Box;
+  246|       |
+  247|       |    #[cfg(feature = "std")]
+  248|       |    pub use std::boxed::Box;
+  249|       |
+  250|       |    #[cfg(not(feature = "std"))]
+  251|       |    pub use alloc::string::String;
+  252|       |
+  253|       |    #[cfg(feature = "std")]
+  254|       |    pub use std::string::String;
+  255|       |}
+  256|       |
+  257|       |#[macro_use]
+  258|       |mod backtrace;
+  259|       |mod chain;
+  260|       |mod context;
+  261|       |mod error;
+  262|       |mod fmt;
+  263|       |mod kind;
+  264|       |mod macros;
+  265|       |mod wrapper;
+  266|       |
+  267|       |use crate::alloc::Box;
+  268|       |use crate::backtrace::Backtrace;
+  269|       |use crate::error::ErrorImpl;
+  270|       |use core::any::{Any, TypeId};
+  271|       |use core::fmt::Display;
+  272|       |use core::mem::ManuallyDrop;
+  273|       |
+  274|       |#[cfg(not(feature = "std"))]
+  275|       |use core::fmt::Debug;
+  276|       |
+  277|       |#[cfg(feature = "std")]
+  278|       |use std::error::Error as StdError;
+  279|       |
+  280|       |#[cfg(not(feature = "std"))]
+  281|       |pub trait StdError: Debug + Display {
+  282|       |    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+  283|       |        None
+  284|       |    }
+  285|       |}
+  286|       |
+  287|       |pub use eyre as format_err;
+  288|       |/// Compatibility re-export of `eyre` for interopt with `anyhow`
+  289|       |pub use eyre as anyhow;
+  290|       |#[doc(hidden)]
+  291|       |pub use Report as ErrReport;
+  292|       |/// Compatibility re-export of `Report` for interopt with `anyhow`
+  293|       |pub use Report as Error;
+  294|       |/// Compatibility re-export of `WrapErr` for interopt with `anyhow`
+  295|       |pub use WrapErr as Context;
+  296|       |
+  297|       |/// The core error reporting type of the library, a wrapper around a dynamic error reporting type.
+  298|       |///
+  299|       |/// `Report` works a lot like `Box<dyn std::error::Error>`, but with these
+  300|       |/// differences:
+  301|       |///
+  302|       |/// - `Report` requires that the error is `Send`, `Sync`, and `'static`.
+  303|       |/// - `Report` guarantees that a backtrace is available, even if the underlying
+  304|       |///   error type does not provide one.
+  305|       |/// - `Report` is represented as a narrow pointer &mdash; exactly one word in
+  306|       |///   size instead of two.
+  307|       |///
+  308|       |/// # Display representations
+  309|       |///
+  310|       |/// When you print an error object using "{}" or to_string(), only the outermost underlying error
+  311|       |/// is printed, not any of the lower level causes. This is exactly as if you had called the Display
+  312|       |/// impl of the error from which you constructed your eyre::Report.
+  313|       |///
+  314|       |/// ```console
+  315|       |/// Failed to read instrs from ./path/to/instrs.json
+  316|       |/// ```
+  317|       |///
+  318|       |/// To print causes as well using eyre's default formatting of causes, use the
+  319|       |/// alternate selector "{:#}".
+  320|       |///
+  321|       |/// ```console
+  322|       |/// Failed to read instrs from ./path/to/instrs.json: No such file or directory (os error 2)
+  323|       |/// ```
+  324|       |///
+  325|       |/// The Debug format "{:?}" includes your backtrace if one was captured. Note
+  326|       |/// that this is the representation you get by default if you return an error
+  327|       |/// from `fn main` instead of printing it explicitly yourself.
+  328|       |///
+  329|       |/// ```console
+  330|       |/// Error: Failed to read instrs from ./path/to/instrs.json
+  331|       |///
+  332|       |/// Caused by:
+  333|       |///     No such file or directory (os error 2)
+  334|       |///
+  335|       |/// Stack backtrace:
+  336|       |///    0: <E as eyre::context::ext::StdError>::ext_report
+  337|       |///              at /git/eyre/src/backtrace.rs:26
+  338|       |///    1: core::result::Result<T,E>::map_err
+  339|       |///              at /git/rustc/src/libcore/result.rs:596
+  340|       |///    2: eyre::context::<impl eyre::WrapErr<T,E,C> for core::result::Result<T,E>>::wrap_err_with
+  341|       |///              at /git/eyre/src/context.rs:58
+  342|       |///    3: testing::main
+  343|       |///              at src/main.rs:5
+  344|       |///    4: std::rt::lang_start
+  345|       |///              at /git/rustc/src/libstd/rt.rs:61
+  346|       |///    5: main
+  347|       |///    6: __libc_start_main
+  348|       |///    7: _start
+  349|       |/// ```
+  350|       |///
+  351|       |/// To see a conventional struct-style Debug representation, use "{:#?}".
+  352|       |///
+  353|       |/// ```console
+  354|       |/// Error {
+  355|       |///     msg: "Failed to read instrs from ./path/to/instrs.json",
+  356|       |///     source: Os {
+  357|       |///         code: 2,
+  358|       |///         kind: NotFound,
+  359|       |///         message: "No such file or directory",
+  360|       |///     },
+  361|       |/// }
+  362|       |/// ```
+  363|       |///
+  364|       |/// If none of the built-in representations are appropriate and you would prefer
+  365|       |/// to render the error and its cause chain yourself, it can be done something
+  366|       |/// like this:
+  367|       |///
+  368|       |/// ```
+  369|       |/// use eyre::{WrapErr, Result};
+  370|       |///
+  371|       |/// fn main() {
+  372|       |///     if let Err(err) = try_main() {
+  373|       |///         eprintln!("ERROR: {}", err);
+  374|       |///         err.chain().skip(1).for_each(|cause| eprintln!("because: {}", cause));
+  375|       |///         std::process::exit(1);
+  376|       |///     }
+  377|       |/// }
+  378|       |///
+  379|       |/// fn try_main() -> Result<()> {
+  380|       |///     # const IGNORE: &str = stringify! {
+  381|       |///     ...
+  382|       |///     # };
+  383|       |///     # Ok(())
+  384|       |/// }
+  385|       |/// ```
+  386|       |pub struct Report<C = DefaultContext>
+  387|       |where
+  388|       |    C: EyreContext,
+  389|       |{
+  390|       |    inner: ManuallyDrop<Box<ErrorImpl<(), C>>>,
+  391|       |}
+  392|       |
+  393|       |/// Context trait for customizing `eyre::Report`
+  394|       |///
+  395|       |/// ## Customization
+  396|       |///
+  397|       |/// In order to insert your own custom context type you must first implement the
+  398|       |/// `eyre::EyreContext` trait.
+  399|       |///
+  400|       |/// Once you've defined a custom Context type you can use it throughout your
+  401|       |/// application by defining a type alias.
+  402|       |///
+  403|       |/// ```rust
+  404|       |/// use backtrace::Backtrace;
+  405|       |/// use eyre::EyreContext;
+  406|       |/// # use eyre::Chain;
+  407|       |/// # use std::error::Error;
+  408|       |///
+  409|       |/// pub struct Context {
+  410|       |///     backtrace: Backtrace,
+  411|       |/// }
+  412|       |///
+  413|       |/// impl EyreContext for Context {
+  414|       |///     // ...
+  415|       |/// #     #[allow(unused_variables)]
+  416|       |/// #     fn default(error: &(dyn Error + 'static)) -> Self {
+  417|       |/// #         let backtrace = Backtrace::new();
+  418|       |/// #         Self { backtrace }
+  419|       |/// #     }
+  420|       |/// #     fn debug(
+  421|       |/// #         &self,
+  422|       |/// #         error: &(dyn Error + 'static),
+  423|       |/// #         f: &mut core::fmt::Formatter<'_>,
+  424|       |/// #     ) -> core::fmt::Result {
+  425|       |/// #         use core::fmt::Write as _;
+  426|       |/// #         if f.alternate() {
+  427|       |/// #             return core::fmt::Debug::fmt(error, f);
+  428|       |/// #         }
+  429|       |/// #         write!(f, "{}", error)?;
+  430|       |/// #         if let Some(cause) = error.source() {
+  431|       |/// #             write!(f, "\n\nCaused by:")?;
+  432|       |/// #             let multiple = cause.source().is_some();
+  433|       |/// #             for (n, error) in Chain::new(cause).enumerate() {
+  434|       |/// #                 writeln!(f)?;
+  435|       |/// #                 if multiple {
+  436|       |/// #                     write!(indenter::Indented::numbered(f, n), "{}", error)?;
+  437|       |/// #                 } else {
+  438|       |/// #                     write!(indenter::Indented::new(f), "{}", error)?;
+  439|       |/// #                 }
+  440|       |/// #             }
+  441|       |/// #         }
+  442|       |/// #         let backtrace = &self.backtrace;
+  443|       |/// #         write!(f, "\n\nStack backtrace:\n{:?}", backtrace)?;
+  444|       |/// #         Ok(())
+  445|       |/// #     }
+  446|       |/// }
+  447|       |///
+  448|       |/// type Report = eyre::Report<Context>;
+  449|       |/// type Result<T, E = eyre::Report<Context>> = core::result::Result<T, E>;
+  450|       |/// ```
+  451|       |pub trait EyreContext: Sized + Send + Sync + 'static {
+  452|       |    /// Default construct a `Context` when constructing a `Report`.
+  453|       |    ///
+  454|       |    /// This method provides a reference to the error being wrapped to support conditional
+  455|       |    /// capturing of context like `backtrace` depending on whether the source error already
+  456|       |    /// captured one.
+  457|       |    ///
+  458|       |    /// # Example
+  459|       |    ///
+  460|       |    /// ```rust
+  461|       |    /// use backtrace::Backtrace;
+  462|       |    /// use eyre::EyreContext;
+  463|       |    /// # use eyre::Chain;
+  464|       |    /// use std::error::Error;
+  465|       |    ///
+  466|       |    /// pub struct Context {
+  467|       |    ///     backtrace: Backtrace,
+  468|       |    /// }
+  469|       |    ///
+  470|       |    /// impl EyreContext for Context {
+  471|       |    /// #     #[allow(unused_variables)]
+  472|       |    ///     fn default(error: &(dyn Error + 'static)) -> Self {
+  473|       |    ///         let backtrace = Backtrace::new();
+  474|       |    ///
+  475|       |    ///         Self { backtrace }
+  476|       |    ///     }
+  477|       |    ///
+  478|       |    ///     // ...
+  479|       |    /// #     fn debug(
+  480|       |    /// #         &self,
+  481|       |    /// #         error: &(dyn Error + 'static),
+  482|       |    /// #         f: &mut core::fmt::Formatter<'_>,
+  483|       |    /// #     ) -> core::fmt::Result {
+  484|       |    /// #         use core::fmt::Write as _;
+  485|       |    /// #         if f.alternate() {
+  486|       |    /// #             return core::fmt::Debug::fmt(error, f);
+  487|       |    /// #         }
+  488|       |    /// #         write!(f, "{}", error)?;
+  489|       |    /// #         if let Some(cause) = error.source() {
+  490|       |    /// #             write!(f, "\n\nCaused by:")?;
+  491|       |    /// #             let multiple = cause.source().is_some();
+  492|       |    /// #             for (n, error) in Chain::new(cause).enumerate() {
+  493|       |    /// #                 writeln!(f)?;
+  494|       |    /// #                 if multiple {
+  495|       |    /// #                     write!(indenter::Indented::numbered(f, n), "{}", error)?;
+  496|       |    /// #                 } else {
+  497|       |    /// #                     write!(indenter::Indented::new(f), "{}", error)?;
+  498|       |    /// #                 }
+  499|       |    /// #             }
+  500|       |    /// #         }
+  501|       |    /// #         let backtrace = &self.backtrace;
+  502|       |    /// #         write!(f, "\n\nStack backtrace:\n{:?}", backtrace)?;
+  503|       |    /// #         Ok(())
+  504|       |    /// #     }
+  505|       |    /// }
+  506|       |    /// ```
+  507|       |    fn default(err: &(dyn StdError + 'static)) -> Self;
+  508|       |
+  509|       |    /// Define the report format
+  510|       |    ///
+  511|       |    /// Used to override the report format of `eyre::Report`
+  512|       |    ///
+  513|       |    /// # Example
+  514|       |    ///
+  515|       |    /// ```rust
+  516|       |    /// use backtrace::Backtrace;
+  517|       |    /// use eyre::EyreContext;
+  518|       |    /// use eyre::Chain;
+  519|       |    /// use std::error::Error;
+  520|       |    ///
+  521|       |    /// pub struct Context {
+  522|       |    ///     backtrace: Backtrace,
+  523|       |    /// }
+  524|       |    ///
+  525|       |    /// impl EyreContext for Context {
+  526|       |    /// #     #[allow(unused_variables)]
+  527|       |    /// #     fn default(error: &(dyn Error + 'static)) -> Self {
+  528|       |    /// #         let backtrace = Backtrace::new();
+  529|       |    /// #         Self { backtrace }
+  530|       |    /// #     }
+  531|       |    ///     // ...
+  532|       |    ///
+  533|       |    ///     fn debug(
+  534|       |    ///         &self,
+  535|       |    ///         error: &(dyn Error + 'static),
+  536|       |    ///         f: &mut core::fmt::Formatter<'_>,
+  537|       |    ///     ) -> core::fmt::Result {
+  538|       |    ///         use core::fmt::Write as _;
+  539|       |    ///
+  540|       |    ///         if f.alternate() {
+  541|       |    ///             return core::fmt::Debug::fmt(error, f);
+  542|       |    ///         }
+  543|       |    ///
+  544|       |    ///         write!(f, "{}", error)?;
+  545|       |    ///
+  546|       |    ///         if let Some(cause) = error.source() {
+  547|       |    ///             write!(f, "\n\nCaused by:")?;
+  548|       |    ///             let multiple = cause.source().is_some();
+  549|       |    ///
+  550|       |    ///             for (n, error) in Chain::new(cause).enumerate() {
+  551|       |    ///                 writeln!(f)?;
+  552|       |    ///                 if multiple {
+  553|       |    ///                     write!(indenter::Indented::numbered(f, n), "{}", error)?;
+  554|       |    ///                 } else {
+  555|       |    ///                     write!(indenter::Indented::new(f), "{}", error)?;
+  556|       |    ///                 }
+  557|       |    ///             }
+  558|       |    ///         }
+  559|       |    ///
+  560|       |    ///         let backtrace = &self.backtrace;
+  561|       |    ///         write!(f, "\n\nStack backtrace:\n{:?}", backtrace)?;
+  562|       |    ///
+  563|       |    ///         Ok(())
+  564|       |    ///     }
+  565|       |    /// }
+  566|       |    /// ```
+  567|       |    fn debug(
+  568|       |        &self,
+  569|       |        error: &(dyn StdError + 'static),
+  570|       |        f: &mut core::fmt::Formatter<'_>,
+  571|       |    ) -> core::fmt::Result;
+  572|       |
+  573|       |    /// Member access function
+  574|       |    ///
+  575|       |    /// The main reason to implement this fn is to provide support for `eyre::Report::backtrace`
+  576|       |    /// which will call this fn on `nightly` when attempting access the captured
+  577|       |    /// `std::backtrace::Backtrace`
+  578|       |    ///
+  579|       |    /// # Example
+  580|       |    fn member_ref(&self, _typeid: TypeId) -> Option<&dyn Any> {
+  581|       |        None
+  582|       |    }
+  583|       |
+  584|       |    #[doc(hidden)]
+  585|       |    fn member_mut(&mut self, _typeid: TypeId) -> Option<&mut dyn Any> {
+  586|       |        None
+  587|       |    }
+  588|       |
+  589|       |    #[doc(hidden)]
+  590|       |    fn display(
+  591|       |        &self,
+  592|       |        error: &(dyn StdError + 'static),
+  593|       |        f: &mut core::fmt::Formatter<'_>,
+  594|       |    ) -> core::fmt::Result {
+  595|      0|        write!(f, "{}", error)?;
+  596|       |
+  597|      0|        if f.alternate() {
+  598|      0|            for cause in crate::chain::Chain::new(error).skip(1) {
+  599|      0|                write!(f, ": {}", cause)?;
+  600|      0|            }
+  601|      0|        }
+  602|       |
+  603|       |        Ok(())
+  604|      0|    }
+  605|       |}
+  606|       |
+  607|       |/// The default provided context for `eyre::Report`.
+  608|       |///
+  609|       |/// On nightly this supports conditionally capturing a `std::backtrace::Backtrace` if the source
+  610|       |/// error did not already capture one.
+  611|       |pub struct DefaultContext {
+  612|       |    backtrace: Option<Backtrace>,
+  613|       |}
+  614|       |
+  615|       |impl EyreContext for DefaultContext {
+  616|       |    #[allow(unused_variables)]
+  617|       |    fn default(error: &(dyn StdError + 'static)) -> Self {
+  618|      0|        let backtrace = backtrace_if_absent!(error);
+  619|       |
+  620|      0|        Self { backtrace }
+  621|      0|    }
+  622|       |
+  623|       |    fn member_ref(&self, typeid: TypeId) -> Option<&dyn Any> {
+  624|      0|        if typeid == TypeId::of::<Backtrace>() {
+  625|      0|            self.backtrace.as_ref().map(|b| b as &dyn Any)
+  626|       |        } else {
+  627|      0|            None
+  628|       |        }
+  629|      0|    }
+  630|       |
+  631|       |    fn debug(
+  632|       |        &self,
+  633|       |        error: &(dyn StdError + 'static),
+  634|       |        f: &mut core::fmt::Formatter<'_>,
+  635|       |    ) -> core::fmt::Result {
+  636|       |        use core::fmt::Write as _;
+  637|       |
+  638|      0|        if f.alternate() {
+  639|      0|            return core::fmt::Debug::fmt(error, f);
+  640|       |        }
+  641|       |
+  642|      0|        write!(f, "{}", error)?;
+  643|       |
+  644|      0|        if let Some(cause) = error.source() {
+  645|      0|            write!(f, "\n\nCaused by:")?;
+  646|      0|            let multiple = cause.source().is_some();
+  647|      0|            for (n, error) in crate::chain::Chain::new(cause).enumerate() {
+  648|      0|                writeln!(f)?;
+  649|      0|                if multiple {
+  650|      0|                    write!(indenter::Indented::numbered(f, n), "{}", error)?;
+  651|       |                } else {
+  652|      0|                    write!(indenter::Indented::new(f), "{}", error)?;
+  653|      0|                }
+  654|      0|            }
+  655|      0|        }
+  656|       |
+  657|       |        #[cfg(backtrace)]
+  658|       |        {
+  659|       |            use std::backtrace::BacktraceStatus;
+  660|       |
+  661|      0|            let backtrace = self
+  662|      0|                .backtrace
+  663|      0|                .as_ref()
+  664|      0|                .or_else(|| error.backtrace())
+  665|      0|                .expect("backtrace capture failed");
+  666|      0|            if let BacktraceStatus::Captured = backtrace.status() {
+  667|      0|                write!(f, "\n\nStack backtrace:\n{}", backtrace)?;
+  668|      0|            }
+  669|       |        }
+  670|       |
+  671|       |        Ok(())
+  672|      0|    }
+  673|       |}
+  674|       |
+  675|       |/// Iterator of a chain of source errors.
+  676|       |///
+  677|       |/// This type is the iterator returned by [`Report::chain`].
+  678|       |///
+  679|       |/// # Example
+  680|       |///
+  681|       |/// ```
+  682|       |/// use eyre::Report;
+  683|       |/// use std::io;
+  684|       |///
+  685|       |/// pub fn underlying_io_error_kind(error: &Report) -> Option<io::ErrorKind> {
+  686|       |///     for cause in error.chain() {
+  687|       |///         if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+  688|       |///             return Some(io_error.kind());
+  689|       |///         }
+  690|       |///     }
+  691|       |///     None
+  692|       |/// }
+  693|       |/// ```
+  694|       |#[cfg(feature = "std")]
+  695|       |#[derive(Clone)]
+  696|       |pub struct Chain<'a> {
+  697|       |    state: crate::chain::ChainState<'a>,
+  698|       |}
+  699|       |
+  700|       |/// `Result<T, Error>`
+  701|       |///
+  702|       |/// This is a reasonable return type to use throughout your application but also for `fn main`; if
+  703|       |/// you do, failures will be printed along with a backtrace if one was captured.
+  704|       |///
+  705|       |/// `eyre::Result` may be used with one *or* two type parameters.
+  706|       |///
+  707|       |/// ```rust
+  708|       |/// use eyre::Result;
+  709|       |///
+  710|       |/// # const IGNORE: &str = stringify! {
+  711|       |/// fn demo1() -> Result<T> {...}
+  712|       |///            // ^ equivalent to std::result::Result<T, eyre::Error>
+  713|       |///
+  714|       |/// fn demo2() -> Result<T, OtherError> {...}
+  715|       |///            // ^ equivalent to std::result::Result<T, OtherError>
+  716|       |/// # };
+  717|       |/// ```
+  718|       |///
+  719|       |/// # Example
+  720|       |///
+  721|       |/// ```
+  722|       |/// # pub trait Deserialize {}
+  723|       |/// #
+  724|       |/// # mod serde_json {
+  725|       |/// #     use super::Deserialize;
+  726|       |/// #     use std::io;
+  727|       |/// #
+  728|       |/// #     pub fn from_str<T: Deserialize>(json: &str) -> io::Result<T> {
+  729|       |/// #         unimplemented!()
+  730|       |/// #     }
+  731|       |/// # }
+  732|       |/// #
+  733|       |/// # #[derive(Debug)]
+  734|       |/// # struct ClusterMap;
+  735|       |/// #
+  736|       |/// # impl Deserialize for ClusterMap {}
+  737|       |/// #
+  738|       |/// use eyre::Result;
+  739|       |///
+  740|       |/// fn main() -> Result<()> {
+  741|       |///     # return Ok(());
+  742|       |///     let config = std::fs::read_to_string("cluster.json")?;
+  743|       |///     let map: ClusterMap = serde_json::from_str(&config)?;
+  744|       |///     println!("cluster info: {:#?}", map);
+  745|       |///     Ok(())
+  746|       |/// }
+  747|       |/// ```
+  748|       |pub type Result<T, E = Report<DefaultContext>> = core::result::Result<T, E>;
+  749|       |
+  750|       |/// Provides the `wrap_err` method for `Result`.
+  751|       |///
+  752|       |/// This trait is sealed and cannot be implemented for types outside of
+  753|       |/// `eyre`.
+  754|       |///
+  755|       |/// # Example
+  756|       |///
+  757|       |/// ```
+  758|       |/// use eyre::{WrapErr, Result};
+  759|       |/// use std::fs;
+  760|       |/// use std::path::PathBuf;
+  761|       |///
+  762|       |/// pub struct ImportantThing {
+  763|       |///     path: PathBuf,
+  764|       |/// }
+  765|       |///
+  766|       |/// impl ImportantThing {
+  767|       |///     # const IGNORE: &'static str = stringify! {
+  768|       |///     pub fn detach(&mut self) -> Result<()> {...}
+  769|       |///     # };
+  770|       |///     # fn detach(&mut self) -> Result<()> {
+  771|       |///     #     unimplemented!()
+  772|       |///     # }
+  773|       |/// }
+  774|       |///
+  775|       |/// pub fn do_it(mut it: ImportantThing) -> Result<Vec<u8>> {
+  776|       |///     it.detach().wrap_err("Failed to detach the important thing")?;
+  777|       |///
+  778|       |///     let path = &it.path;
+  779|       |///     let content = fs::read(path)
+  780|       |///         .wrap_err_with(|| format!("Failed to read instrs from {}", path.display()))?;
+  781|       |///
+  782|       |///     Ok(content)
+  783|       |/// }
+  784|       |/// ```
+  785|       |///
+  786|       |/// When printed, the outermost error would be printed first and the lower
+  787|       |/// level underlying causes would be enumerated below.
+  788|       |///
+  789|       |/// ```console
+  790|       |/// Error: Failed to read instrs from ./path/to/instrs.json
+  791|       |///
+  792|       |/// Caused by:
+  793|       |///     No such file or directory (os error 2)
+  794|       |/// ```
+  795|       |///
+  796|       |/// # Effect on downcasting
+  797|       |///
+  798|       |/// After attaching a message of type `D` onto an error of type `E`, the resulting
+  799|       |/// `eyre::Error` may be downcast to `D` **or** to `E`.
+  800|       |///
+  801|       |/// That is, in codebases that rely on downcasting, Eyre's wrap_err supports
+  802|       |/// both of the following use cases:
+  803|       |///
+  804|       |///   - **Attaching messages whose type is insignificant onto errors whose type
+  805|       |///     is used in downcasts.**
+  806|       |///
+  807|       |///     In other error libraries whose wrap_err is not designed this way, it can
+  808|       |///     be risky to introduce messages to existing code because new message might
+  809|       |///     break existing working downcasts. In Eyre, any downcast that worked
+  810|       |///     before adding the message will continue to work after you add a message, so
+  811|       |///     you should freely wrap errors wherever it would be helpful.
+  812|       |///
+  813|       |///     ```
+  814|       |///     # use eyre::bail;
+  815|       |///     # use thiserror::Error;
+  816|       |///     #
+  817|       |///     # #[derive(Error, Debug)]
+  818|       |///     # #[error("???")]
+  819|       |///     # struct SuspiciousError;
+  820|       |///     #
+  821|       |///     # fn helper() -> Result<()> {
+  822|       |///     #     bail!(SuspiciousError);
+  823|       |///     # }
+  824|       |///     #
+  825|       |///     use eyre::{WrapErr, Result};
+  826|       |///
+  827|       |///     fn do_it() -> Result<()> {
+  828|       |///         helper().wrap_err("Failed to complete the work")?;
+  829|       |///         # const IGNORE: &str = stringify! {
+  830|       |///         ...
+  831|       |///         # };
+  832|       |///         # unreachable!()
+  833|       |///     }
+  834|       |///
+  835|       |///     fn main() {
+  836|       |///         let err = do_it().unwrap_err();
+  837|       |///         if let Some(e) = err.downcast_ref::<SuspiciousError>() {
+  838|       |///             // If helper() returned SuspiciousError, this downcast will
+  839|       |///             // correctly succeed even with the message in between.
+  840|       |///             # return;
+  841|       |///         }
+  842|       |///         # panic!("expected downcast to succeed");
+  843|       |///     }
+  844|       |///     ```
+  845|       |///
+  846|       |///   - **Attaching message whose type is used in downcasts onto errors whose
+  847|       |///     type is insignificant.**
+  848|       |///
+  849|       |///     Some codebases prefer to use machine-readable messages to categorize
+  850|       |///     lower level errors in a way that will be actionable to higher levels of
+  851|       |///     the application.
+  852|       |///
+  853|       |///     ```
+  854|       |///     # use eyre::bail;
+  855|       |///     # use thiserror::Error;
+  856|       |///     #
+  857|       |///     # #[derive(Error, Debug)]
+  858|       |///     # #[error("???")]
+  859|       |///     # struct HelperFailed;
+  860|       |///     #
+  861|       |///     # fn helper() -> Result<()> {
+  862|       |///     #     bail!("no such file or directory");
+  863|       |///     # }
+  864|       |///     #
+  865|       |///     use eyre::{WrapErr, Result};
+  866|       |///
+  867|       |///     fn do_it() -> Result<()> {
+  868|       |///         helper().wrap_err(HelperFailed)?;
+  869|       |///         # const IGNORE: &str = stringify! {
+  870|       |///         ...
+  871|       |///         # };
+  872|       |///         # unreachable!()
+  873|       |///     }
+  874|       |///
+  875|       |///     fn main() {
+  876|       |///         let err = do_it().unwrap_err();
+  877|       |///         if let Some(e) = err.downcast_ref::<HelperFailed>() {
+  878|       |///             // If helper failed, this downcast will succeed because
+  879|       |///             // HelperFailed is the message that has been attached to
+  880|       |///             // that error.
+  881|       |///             # return;
+  882|       |///         }
+  883|       |///         # panic!("expected downcast to succeed");
+  884|       |///     }
+  885|       |///     ```
+  886|       |pub trait WrapErr<T, E, C>: context::private::Sealed<C>
+  887|       |where
+  888|       |    C: EyreContext,
+  889|       |{
+  890|       |    /// Wrap the error value with a new adhoc error
+  891|       |    fn wrap_err<D>(self, msg: D) -> Result<T, Report<C>>
+  892|       |    where
+  893|       |        D: Display + Send + Sync + 'static;
+  894|       |
+  895|       |    /// Wrap the error value with a new adhoc error that is evaluated lazily
+  896|       |    /// only once an error does occur.
+  897|       |    fn wrap_err_with<D, F>(self, f: F) -> Result<T, Report<C>>
+  898|       |    where
+  899|       |        D: Display + Send + Sync + 'static,
+  900|       |        F: FnOnce() -> D;
+  901|       |
+  902|       |    /// Compatibility re-export of wrap_err for interopt with `anyhow`
+  903|       |    fn context<D>(self, msg: D) -> Result<T, Report<C>>
+  904|       |    where
+  905|       |        D: Display + Send + Sync + 'static;
+  906|       |
+  907|       |    /// Compatibility re-export of wrap_err_with for interopt with `anyhow`
+  908|       |    fn with_context<D, F>(self, f: F) -> Result<T, Report<C>>
+  909|       |    where
+  910|       |        D: Display + Send + Sync + 'static,
+  911|       |        F: FnOnce() -> D;
+  912|       |}
+  913|       |
+  914|       |// Not public API. Referenced by macro-generated code.
+  915|       |#[doc(hidden)]
+  916|       |pub mod private {
+  917|       |    use crate::{EyreContext, Report};
+  918|       |    use core::fmt::{Debug, Display};
+  919|       |
+  920|       |    //     #[cfg(backtrace)]
+  921|       |    //     use std::backtrace::Backtrace;
+  922|       |
+  923|       |    pub use core::result::Result::Err;
+  924|       |
+  925|       |    #[doc(hidden)]
+  926|       |    pub mod kind {
+  927|       |        pub use crate::kind::{AdhocKind, TraitKind};
+  928|       |
+  929|       |        #[cfg(feature = "std")]
+  930|       |        pub use crate::kind::BoxedKind;
+  931|       |    }
+  932|       |
+  933|       |    pub fn new_adhoc<M, C>(message: M) -> Report<C>
+  934|       |    where
+  935|       |        C: EyreContext,
+  936|       |        M: Display + Debug + Send + Sync + 'static,
+  937|       |    {
+  938|       |        Report::from_adhoc(message)
+  939|       |    }
+  940|       |}
+
+/home/jlusby/.cargo/registry/src/github.com-1ecc6299db9ec823/indenter-0.1.3/src/lib.rs:
+    1|       |use std::fmt;
+    2|       |
+    3|       |/// Helper struct for efficiently numbering and correctly indenting multi line display
+    4|       |/// implementations
+    5|       |pub struct Indented<'a, D> {
+    6|       |    inner: &'a mut D,
+    7|       |    ind: Option<usize>,
+    8|       |    started: bool,
+    9|       |}
+   10|       |
+   11|       |impl<'a, D> Indented<'a, D> {
+   12|       |    /// Wrap a formatter number the first line and indent all lines of input before forwarding the
+   13|       |    /// output to the inner formatter
+   14|       |    pub fn numbered(inner: &'a mut D, ind: usize) -> Self {
+   15|       |        Self {
+   16|       |            inner,
+   17|       |            ind: Some(ind),
+   18|       |            started: false,
+   19|       |        }
+   20|       |    }
+   21|       |
+   22|       |    pub fn new(inner: &'a mut D) -> Self {
+   23|       |        Self {
+   24|       |            inner,
+   25|       |            ind: None,
+   26|       |            started: false,
+   27|       |        }
+   28|       |    }
+   29|       |}
+   30|       |
+   31|       |impl<T> fmt::Write for Indented<'_, T>
+   32|       |where
+   33|       |    T: fmt::Write,
+   34|       |{
+   35|       |    fn write_str(&mut self, s: &str) -> fmt::Result {
+   36|      0|        for (ind, mut line) in s.split('\n').enumerate() {
+   37|      0|            if !self.started {
+   38|       |                // trim first line to ensure it lines up with the number nicely
+   39|      0|                line = line.trim_start();
+   40|       |                // Don't render the first line unless its actually got text on it
+   41|      0|                if line.is_empty() {
+   42|       |                    continue;
+   43|       |                }
+   44|       |
+   45|      0|                self.started = true;
+   46|      0|                match self.ind {
+   47|      0|                    Some(ind) => self.inner.write_fmt(format_args!("{: >4}: ", ind))?,
+   48|      0|                    None => self.inner.write_fmt(format_args!("    "))?,
+   49|      0|                }
+   50|      0|            } else if ind > 0 {
+   51|      0|                self.inner.write_char('\n')?;
+   52|      0|                if self.ind.is_some() {
+   53|      0|                    self.inner.write_fmt(format_args!("       "))?;
+   54|       |                } else {
+   55|      0|                    self.inner.write_fmt(format_args!("    "))?;
+   56|      0|                }
+   57|      0|            }
+   58|       |
+   59|      0|            self.inner.write_fmt(format_args!("{}", line))?;
+   60|      0|        }
+   61|       |
+   62|      0|        Ok(())
+   63|      0|    }
+   64|       |}
+   65|       |
+   66|       |#[cfg(test)]
+   67|       |mod tests {
+   68|       |    use super::*;
+   69|       |    use std::fmt::Write as _;
+   70|       |
+   71|       |    #[test]
+   72|       |    fn one_digit() {
+   73|       |        let input = "verify\nthis";
+   74|       |        let expected = "   2: verify\n       this";
+   75|       |        let mut output = String::new();
+   76|       |
+   77|       |        Indented {
+   78|       |            inner: &mut output,
+   79|       |            ind: Some(2),
+   80|       |            started: false,
+   81|       |        }
+   82|       |        .write_str(input)
+   83|       |        .unwrap();
+   84|       |
+   85|       |        assert_eq!(expected, output);
+   86|       |    }
+   87|       |
+   88|       |    #[test]
+   89|       |    fn two_digits() {
+   90|       |        let input = "verify\nthis";
+   91|       |        let expected = "  12: verify\n       this";
+   92|       |        let mut output = String::new();
+   93|       |
+   94|       |        Indented {
+   95|       |            inner: &mut output,
+   96|       |            ind: Some(12),
+   97|       |            started: false,
+   98|       |        }
+   99|       |        .write_str(input)
+  100|       |        .unwrap();
+  101|       |
+  102|       |        assert_eq!(expected, output);
+  103|       |    }
+  104|       |
+  105|       |    #[test]
+  106|       |    fn no_digits() {
+  107|       |        let input = "verify\nthis";
+  108|       |        let expected = "    verify\n    this";
+  109|       |        let mut output = String::new();
+  110|       |
+  111|       |        Indented {
+  112|       |            inner: &mut output,
+  113|       |            ind: None,
+  114|       |            started: false,
+  115|       |        }
+  116|       |        .write_str(input)
+  117|       |        .unwrap();
+  118|       |
+  119|       |        assert_eq!(expected, output);
+  120|       |    }
+  121|       |}
+
+src/deser.rs:
+    1|       |//! Deserialization helper functions
+    2|       |use crate::{Error, Frame, Kind};
+    3|       |
+    4|       |pub(crate) fn close_bracket(bt: &str) -> Result<&str, Error> {
+    5|      2|    start(bt, "]")
+    6|      2|}
+    7|       |
+    8|       |pub(crate) fn frame(bt: &str) -> Result<(&str, Frame), Error> {
+    9|     34|    let (bt, frame) = delimited(bt, "{", "}")?;
+                                                           ^0
+   10|     34|    let frame = start(frame, "fn: ")?;
+                      ^33                         ^1
+   11|     33|    let file_match = ", file: ";
+   12|     33|    let file_start = frame.find(file_match);
+   13|     33|    let line_match = ", line: ";
+   14|     33|    let line_start = frame.find(line_match);
+   15|     33|
+   16|     33|    let fn_end = file_start.or(line_start).unwrap_or_else(|| frame.len());
+                                                                           ^4
+   17|     33|    let function = frame[..fn_end].trim_matches('"').to_string();
+   18|     33|
+   19|     33|    let file = file_start
+   20|     33|        .map(|start| {
+   21|       |            (
+   22|     27|                start + file_match.len(),
+   23|     27|                line_start.unwrap_or_else(|| frame.len()),
+                                                           ^2
+   24|     27|            )
+   25|     33|        })
+   26|     33|        .map(|(start, end)| &frame[start..end])
+                                          ^27
+   27|     33|        .map(|file| file.trim_matches('"'))
+                                  ^27
+   28|     33|        .map(ToString::to_string);
+   29|       |
+   30|     33|    let line = line_start
+   31|     33|        .map(|start| (start + line_match.len(), frame.len()))
+                                    ^27                       ^27
+   32|     33|        .map(|(start, end)| &frame[start..end])
+                                          ^27
+   33|     33|        .map(|line| {
+   34|     27|            line.parse::<usize>()
+   35|     27|                .map_err(|source| Kind::LineParse(line.into(), source))
+   36|     33|        })
+   37|     33|        .transpose()?;
+                                  ^0
+   38|       |
+   39|       |    Ok((
+   40|       |        bt,
+   41|       |        Frame {
+   42|       |            function,
+   43|       |            line,
+   44|       |            file,
+   45|       |        },
+   46|       |    ))
+   47|     34|}
+   48|       |
+   49|       |fn delimited<'a>(bt: &'a str, start: &str, end: &str) -> Result<(&'a str, &'a str), Error> {
+   50|     35|    let mut depth = 1;
+   51|     35|
+   52|     35|    let start_len = start.chars().count();
+   53|       |
+   54|     35|    if !bt.starts_with(start) {
+   55|      0|        Err(Kind::InvalidInput {
+   56|      0|            expected: start.into(),
+   57|      0|            found: bt.chars().take(start_len).collect(),
+   58|      0|        })?;
+   59|     35|    }
+   60|       |
+   61|     35|    let start_ind = start_len;
+   62|     35|    let mut end_ind = None;
+   63|       |
+   64|  3.79k|    for (ind, _) in bt.char_indices().skip(start_len) {
+                                  ^35
+   65|  3.79k|        match bt.get(ind..) {
+   66|  3.79k|            Some(next) if next.starts_with(start) => depth += 1,
+                               ^13                            ^13^3.78k^13
+   67|  3.78k|            Some(next) if next.starts_with(end) => depth -= 1,
+                               ^48                          ^48^3.73k^48
+   68|  3.73k|            Some(_) => (),
+   69|      0|            None => unimplemented!(),
+   70|       |        }
+   71|       |
+   72|  3.79k|        if depth == 0 {
+   73|     35|            end_ind = Some(ind);
+   74|     35|            break;
+   75|       |        }
+   76|  3.76k|    }
+   77|       |
+   78|     35|    if let Some(end_ind) = end_ind {
+   79|     35|        let end = end_ind + end.len();
+   80|     35|        Ok((&bt[end..], &bt[start_ind..end_ind].trim()))
+   81|       |    } else {
+   82|      0|        unimplemented!()
+   83|       |    }
+   84|     35|}
+   85|       |
+   86|       |pub(crate) fn header(bt: &str) -> Result<&str, Error> {
+   87|      8|    let mut parts = bt.splitn(2, '[');
+   88|      8|    let header = parts.next().unwrap();
+   89|      8|
+   90|      8|    match header {
+   91|      8|        "Backtrace " => (),
+                                      ^3
+   92|      5|        "<disabled>" | "disabled backtrace" => Err(Kind::Disabled)?,
+                                     ^3                      ^3                 ^3
+   93|      2|        "unsupported backtrace" => Err(Kind::Unsupported)?,
+                                                 ^1                    ^1
+   94|      1|        _ => Err(Kind::UnexpectedInput(header.into()))?,
+   95|      0|    }
+   96|       |
+   97|      3|    Ok(parts.next().unwrap())
+   98|      8|}
+   99|       |
+  100|       |fn start<'a>(bt: &'a str, expected: &str) -> Result<&'a str, Error> {
+  101|     68|    if bt.starts_with(expected) {
+  102|     64|        return Ok(bt.trim_start_matches(expected));
+  103|       |    }
+  104|       |
+  105|      4|    Err(Kind::InvalidInput {
+  106|      4|        found: bt.chars().take(expected.chars().count()).collect(),
+  107|      4|        expected: expected.to_string(),
+  108|      4|    })?
+  109|     68|}
+  110|       |
+  111|       |pub(crate) fn trailing_comma(bt: &str) -> (&str, bool) {
+  112|     31|    start(bt, ", ").map(|bt| (bt, true)).unwrap_or((bt, false))
+                                           ^28
+  113|     31|}
+  114|       |
+  115|       |#[cfg(test)]
+  116|       |mod tests {
+  117|       |    use super::*;
+  118|       |
+  119|       |    #[test]
+  120|      1|    fn frame_test() -> eyre::Result<()> {
+  121|      1|        let input = "{fn: \"function_name\", file: \"file_name\", line: 10} extra input";
+  122|      1|        let (input, f) = frame(input)?;
+                                                   ^0
+  123|      1|        assert_eq!(" extra input", input);
+  124|      1|        assert_eq!(
+  125|      1|            Frame {
+  126|      1|                function: "function_name".into(),
+  127|      1|                file: Some("file_name".into()),
+  128|      1|                line: Some(10)
+  129|      1|            },
+  130|      1|            f
+  131|      1|        );
+  132|      1|
+  133|      1|        let input = "{fn: \"function_name\", line: 10} extra input";
+  134|      1|        let (input, f) = frame(input)?;
+                                                   ^0
+  135|      1|        assert_eq!(" extra input", input);
+  136|      1|        assert_eq!(
+  137|      1|            Frame {
+  138|      1|                function: "function_name".into(),
+  139|      1|                file: None,
+  140|      1|                line: Some(10)
+  141|      1|            },
+  142|      1|            f
+  143|      1|        );
+  144|      1|
+  145|      1|        let input = "{fn: \"function_name\", file: \"file_name\"} extra input";
+  146|      1|        let (input, f) = frame(input)?;
+                                                   ^0
+  147|      1|        assert_eq!(" extra input", input);
+  148|      1|        assert_eq!(
+  149|      1|            Frame {
+  150|      1|                function: "function_name".into(),
+  151|      1|                file: Some("file_name".into()),
+  152|      1|                line: None,
+  153|      1|            },
+  154|      1|            f
+  155|      1|        );
+  156|      1|
+  157|      1|        let input = "{fn: \"function_name\"} extra input";
+  158|      1|        let (input, f) = frame(input)?;
+                                                   ^0
+  159|      1|        assert_eq!(" extra input", input);
+  160|      1|        assert_eq!(
+  161|      1|            Frame {
+  162|      1|                function: "function_name".into(),
+  163|      1|                file: None,
+  164|      1|                line: None,
+  165|      1|            },
+  166|      1|            f
+  167|      1|        );
+  168|      1|
+  169|      1|        let input = "{n: \"function_name\"} extra input";
+  170|      1|        let e = frame(input).unwrap_err();
+  171|      1|        match e {
+  172|      1|            Error {
+  173|      1|                kind: Kind::InvalidInput { found, .. },
+  174|      1|                ..
+  175|      1|            } => {
+  176|      1|                assert_eq!(found, "n: \"");
+  177|      1|            }
+  178|      1|            _ => Err(e)?,
+                               ^0    ^0
+  179|      1|        }
+                       ^0
+  180|      1|
+  181|      1|        Ok(())
+  182|      1|    }
+  183|       |
+  184|       |    #[test]
+  185|      1|    fn start_test() -> eyre::Result<()> {
+  186|      1|        let input = "hi whatsup";
+  187|      1|        let input = start(input, "hi ")?;
+                                                     ^0
+  188|      1|        assert_eq!("whatsup", input);
+                      ^0
+  189|      1|
+  190|      1|        Ok(())
+  191|      1|    }
+  192|       |
+  193|       |    #[test]
+  194|      1|    fn delimited_test() -> eyre::Result<()> {
+  195|      1|        let input = "{this is delimited by {} some garbage} the remainder";
+  196|      1|        let (input, delimited_bit) = delimited(input, "{", "}")?;
+                                                                             ^0
+  197|      1|        assert_eq!("this is delimited by {} some garbage", delimited_bit);
+  198|      1|        assert_eq!(" the remainder", input);
+                      ^0
+  199|      1|
+  200|      1|        Ok(())
+  201|      1|    }
+  202|       |
+  203|       |    #[test]
+  204|      1|    fn trailing_comma_test() -> eyre::Result<()> {
+  205|      1|        let input = ", hi whatsup";
+  206|      1|        let (input, had) = trailing_comma(input);
+  207|      1|        assert!(had);
+  208|      1|        let (_, had) = trailing_comma(input);
+  209|      1|        assert!(!had);
+  210|      1|
+  211|      1|        Ok(())
+  212|      1|    }
+  213|       |
+  214|       |    #[test]
+  215|      1|    fn header_test() -> eyre::Result<()> {
+  216|      1|        let input = header("Backtrace [")?;
+                                                       ^0
+  217|      1|        assert!(input.is_empty());
+  218|      1|
+  219|      1|        match header("<disabled>") {
+  220|      1|            Err(Error {
+  221|      1|                kind: Kind::Disabled,
+  222|      1|                ..
+  223|      1|            }) => (),
+  224|      1|            Err(e) => Err(e)?,
+                              ^0    ^0    ^0
+  225|      1|            _ => unreachable!(),
+                               ^0
+  226|      1|        }
+                       ^0
+  227|      1|
+  228|      1|        match header("disabled backtrace") {
+  229|      1|            Err(Error {
+  230|      1|                kind: Kind::Disabled,
+  231|      1|                ..
+  232|      1|            }) => (),
+  233|      1|            Err(e) => Err(e)?,
+                              ^0    ^0    ^0
+  234|      1|            _ => unreachable!(),
+                               ^0
+  235|      1|        }
+                       ^0
+  236|      1|
+  237|      1|        match header("unsupported backtrace") {
+  238|      1|            Err(Error {
+  239|      1|                kind: Kind::Unsupported,
+  240|      1|                ..
+  241|      1|            }) => (),
+  242|      1|            Err(e) => Err(e)?,
+                              ^0    ^0    ^0
+  243|      1|            _ => unreachable!(),
+                               ^0
+  244|      1|        }
+                       ^0
+  245|      1|
+  246|      1|        match header("bunch of random garbage") {
+  247|      1|            Err(Error {
+  248|      1|                kind: Kind::UnexpectedInput(input),
+  249|      1|                ..
+  250|      1|            }) => assert_eq!("bunch of random garbage", input),
+  251|      1|            Err(e) => Err(e)?,
+                              ^0    ^0    ^0
+  252|      1|            _ => unreachable!(),
+                               ^0
+  253|      1|        }
+                       ^0
+  254|      1|
+  255|      1|        Ok(())
+  256|      1|    }
+  257|       |}
+
+src/lib.rs:
+    1|      1|//! An error utility library for deserializing `std::backtrace::Backtrace`'s//! An error utility library for deserializing `std::backtrace::Backtrace`'s
+    2|       |//! based on its `Debug` format.
+    3|       |#![doc(html_root_url = "https://docs.rs/btparse/0.1.1")]
+    4|       |#![feature(backtrace)]
+    5|       |#![allow(clippy::try_err)]
+    6|       |use std::fmt;
+    7|       |
+    8|       |mod deser;
+    9|       |
+   10|       |/// A deserialized Backtrace.
+   11|       |///
+   12|       |/// # Example
+   13|       |///
+   14|       |/// ```rust
+   15|       |/// #![feature(backtrace)]
+   16|       |///
+   17|       |/// let backtrace = std::backtrace::Backtrace::force_capture();
+   18|       |/// let backtrace = btparse::deserialize(&backtrace).unwrap();
+   19|       |/// for frame in &backtrace.frames {
+   20|       |///     println!("{:?}", frame);
+   21|       |/// }
+   22|       |/// ```
+   23|      2|#[derive(Debug)]
+   24|       |#[non_exhaustive]
+   25|       |pub struct Backtrace {
+   26|       |    pub frames: Vec<Frame>,
+   27|       |}
+   28|       |
+   29|       |/// A backtrace frame.
+   30|     29|#[derive(Debug, PartialEq)]
+                                      ^8
+   31|       |pub struct Frame {
+   32|       |    pub function: String,
+   33|       |    pub file: Option<String>,
+   34|       |    pub line: Option<usize>,
+   35|       |}
+   36|       |
+   37|       |/// An error that prevented a backtrace from being deserialized.
+   38|       |#[derive(Debug)]
+   39|       |pub struct Error {
+   40|       |    kind: Kind,
+   41|       |}
+   42|       |
+   43|       |#[derive(Debug)]
+   44|       |enum Kind {
+   45|       |    Disabled,
+   46|       |    Empty,
+   47|       |    Unsupported,
+   48|       |    UnexpectedInput(String),
+   49|       |    InvalidInput { expected: String, found: String },
+   50|       |    LineParse(String, std::num::ParseIntError),
+   51|       |}
+   52|       |
+   53|       |impl fmt::Display for Error {
+   54|       |    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+   55|       |        writeln!(f, "{}", self.kind)
+   56|       |    }
+   57|       |}
+   58|       |
+   59|       |impl fmt::Display for Kind {
+   60|       |    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+   61|      0|        match self {
+   62|      0|            Self::Disabled => write!(f, "backtrace capture disabled"),
+   63|      0|            Self::Empty => write!(f, "input is empty"),
+   64|      0|            Self::Unsupported => write!(f, "backtrace capture unsupported on this platform"),
+   65|      0|            Self::UnexpectedInput(input) => write!(f, "encountered unexpected input: {:?}", input),
+   66|      0|            Self::InvalidInput { expected, found } => write!(
+   67|      0|                f,
+   68|      0|                "invalid input, expected: {:?}, found: {:?}",
+   69|      0|                expected, found
+   70|      0|            ),
+   71|      0|            Self::LineParse(input, _) => {
+   72|      0|                write!(f, "invalid line input for line number: {:?}", input)
+   73|      0|            }
+   74|      0|        }
+   75|      0|    }
+   76|       |}
+   77|       |
+   78|       |impl std::error::Error for Error {}
+   79|       |
+   80|       |impl From<Kind> for Error {
+   81|       |    fn from(kind: Kind) -> Self {
+   82|      9|        Self { kind }
+   83|      9|    }
+   84|       |}
+   85|       |
+   86|       |/// Deserialize a backtrace based on its debug format and return a parsed
+   87|       |/// representation containing a vector of frames.
+   88|       |pub fn deserialize(bt: &std::backtrace::Backtrace) -> Result<Backtrace, Error> {
+   89|      2|    let bt_str = format!("{:?}", bt);
+   90|      2|    deserialize_str(&bt_str)
+   91|      2|}
+   92|       |
+   93|       |fn deserialize_str(bt: &str) -> Result<Backtrace, Error> {
+   94|      3|    let mut frames = vec![];
+   95|      3|    let mut bt = deser::header(bt)?;
+                      ^2                        ^1
+   96|       |
+   97|       |    loop {
+   98|     29|        let (bt_next, frame) = deser::frame(bt)?;
+                                                             ^0
+   99|     29|        bt = bt_next;
+  100|     29|        frames.push(frame);
+  101|     29|
+  102|     29|        let (bt_next, had_comma) = deser::trailing_comma(bt);
+  103|     29|        bt = bt_next;
+  104|       |
+  105|     29|        if !had_comma {
+  106|      2|            break;
+  107|       |        }
+  108|     27|    }
+  109|       |
+  110|      2|    let bt = deser::close_bracket(bt)?;
+                                                   ^0
+  111|       |
+  112|      2|    if !bt.is_empty() {
+  113|      0|        Err(Kind::UnexpectedInput(bt.into()))?;
+  114|      2|    }
+  115|       |
+  116|      2|    Ok(Backtrace { frames })
+  117|      3|}
+  118|       |
+  119|       |#[cfg(test)]
+  120|       |mod tests {
+  121|       |    use super::*;
+  122|       |
+  123|       |    #[test]
+  124|      1|    fn backtrace_deserialize_enabled() -> eyre::Result<()> {
+  125|      1|        let bt = std::backtrace::Backtrace::force_capture();
+  126|      1|        let bt_parsed = super::deserialize(&bt)?;
+                                                             ^0
+  127|      1|        dbg!(bt_parsed);
+  128|      1|
+  129|      1|        Ok(())
+  130|      1|    }
+  131|       |
+  132|       |    #[test]
+  133|      1|    fn backtrace_deserialize_disabled() -> eyre::Result<()> {
+  134|      1|        let bt = std::backtrace::Backtrace::capture();
+  135|      1|        let bt_parsed = super::deserialize(&bt);
+  136|      1|        match bt_parsed {
+  137|      1|            Ok(_) => panic!("this should not parse"),
+                                   ^0
+  138|      1|            Err(Error {
+  139|      1|                kind: Kind::Disabled,
+  140|      1|                ..
+  141|      1|            }) => (),
+  142|      1|            Err(e) => Err(e)?,
+                              ^0    ^0    ^0
+  143|      1|        }
+                       ^0
+  144|      1|
+  145|      1|        Ok(())
+  146|      1|    }
+  147|       |
+  148|       |    #[test]
+  149|      1|    fn deserialize_simple() -> eyre::Result<()> {
+  150|      1|        let backtrace = r#"Backtrace [{fn: "fn1", file: "fi"le1", line: 1}, {fn: "fn2", line: 2}, {fn: "fn3", file: "file3"}, {fn: "fn4"}]"#;
+  151|      1|        let expected = Backtrace {
+  152|      1|            frames: vec![
+  153|      1|                Frame {
+  154|      1|                    function: "fn1".into(),
+  155|      1|                    file: Some("fi\"le1".into()),
+  156|      1|                    line: Some(1),
+  157|      1|                },
+  158|      1|                Frame {
+  159|      1|                    function: "fn2".into(),
+  160|      1|                    file: None,
+  161|      1|                    line: Some(2),
+  162|      1|                },
+  163|      1|                Frame {
+  164|      1|                    function: "fn3".into(),
+  165|      1|                    file: Some("file3".into()),
+  166|      1|                    line: None,
+  167|      1|                },
+  168|      1|                Frame {
+  169|      1|                    function: "fn4".into(),
+  170|      1|                    file: None,
+  171|      1|                    line: None,
+  172|      1|                },
+  173|      1|            ],
+  174|      1|        };
+  175|      1|        let bt_parsed = super::deserialize_str(backtrace)?;
+                                                                       ^0
+  176|      1|        dbg!(&bt_parsed);
+  177|      1|
+  178|      1|        assert_eq!(expected.frames, bt_parsed.frames);
+                      ^0
+  179|      1|
+  180|      1|        Ok(())
+  181|      1|    }
+  182|       |}
+
