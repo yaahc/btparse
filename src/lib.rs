@@ -43,7 +43,6 @@ pub struct Error {
 #[derive(Debug)]
 enum Kind {
     Disabled,
-    Empty,
     Unsupported,
     UnexpectedInput(String),
     InvalidInput { expected: String, found: String },
@@ -60,7 +59,6 @@ impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Disabled => write!(f, "backtrace capture disabled"),
-            Self::Empty => write!(f, "input is empty"),
             Self::Unsupported => write!(f, "backtrace capture unsupported on this platform"),
             Self::UnexpectedInput(input) => write!(f, "encountered unexpected input: {:?}", input),
             Self::InvalidInput { expected, found } => write!(
@@ -68,8 +66,8 @@ impl fmt::Display for Kind {
                 "invalid input, expected: {:?}, found: {:?}",
                 expected, found
             ),
-            Self::LineParse(input, _) => {
-                write!(f, "invalid line input for line number: {:?}", input)
+            Self::LineParse(input, e) => {
+                write!(f, "invalid line input for line number: {:?} ({:?})", input, e)
             }
         }
     }
