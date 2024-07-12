@@ -1,7 +1,6 @@
 //! An error utility library for deserializing `std::backtrace::Backtrace`'s
 //! based on its `Debug` format.
 #![doc(html_root_url = "https://docs.rs/btparse/0.1.1")]
-#![feature(backtrace)]
 #![allow(clippy::try_err)]
 use std::fmt;
 
