@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - ReleaseDate
 
+## [0.2.0] - 2024-09-01
+- Introduce MSRV and set it to 1.65
+- Remove `backtrace` nightly feature, allowing the crate to compile on stable Rust
+
 ## [0.1.1] - 2020-11-18
 ### Fixed
 - Exposed the `frames` within a parsed backtrace so this crate is actually
